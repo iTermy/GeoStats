@@ -13,6 +13,7 @@
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @grant        GM_download
 // @connect      www.geoguessr.com
 // @connect      geoguessr.com
 // @run-at       document-idle
@@ -31,6 +32,269 @@
         CHECK_INTERVAL: 5000,
         STORAGE_KEY: 'geoguessr_stats_data'
     };
+
+    // ==================== IMAGE CAPTURE MODULE ====================
+    const IMAGE_CAPTURE = {
+        enabled: GM_getValue('capture_images', false),
+        quality: GM_getValue('image_quality', 0.8),
+        format: 'jpeg',
+        capturedThisRound: false,
+        currentRoundNumber: 0,
+        debugMode: true // Set to false once working
+    };
+
+    // Canvas detection and capture functions
+    function findStreetViewCanvas() {
+        const canvases = document.querySelectorAll('canvas');
+        
+        if (IMAGE_CAPTURE.debugMode) {
+            console.log(`🖼️ Found ${canvases.length} canvases on page:`);
+            canvases.forEach((canvas, index) => {
+                console.log(`  Canvas ${index}: ${canvas.width}x${canvas.height}, parent: ${canvas.parentElement?.className}`);
+            });
+        }
+        
+        // Strategy 1: Find the largest canvas (usually Street View)
+        const largeCanvases = Array.from(canvases)
+            .filter(c => c.width >= 500 && c.height >= 400)
+            .sort((a, b) => (b.width * b.height) - (a.width * a.height));
+        
+        if (largeCanvases.length > 0) {
+            // Street View is typically the largest or second-largest canvas
+            // Sometimes UI overlay is on top
+            return largeCanvases[0];
+        }
+        
+        // Strategy 2: Look for canvas in specific game container
+        const gameCanvas = document.querySelector('.game_canvas canvas, .game-layout__canvas canvas, [class*="game"] canvas');
+        if (gameCanvas && gameCanvas.width > 400) {
+            return gameCanvas;
+        }
+        
+        return null;
+    }
+
+    function captureCanvas(canvas) {
+        try {
+            // First, check if this is a WebGL canvas
+            const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true }) || 
+                    canvas.getContext('webgl2', { preserveDrawingBuffer: true }) || 
+                    canvas.getContext('experimental-webgl', { preserveDrawingBuffer: true });
+            
+            if (gl) {
+                console.log('🎨 WebGL context detected');
+                
+                // Method 1: Try to force preserve the drawing buffer
+                if (!gl.getContextAttributes().preserveDrawingBuffer) {
+                    console.log('⚠️ Drawing buffer not preserved, attempting workaround...');
+                    
+                    // Create a new canvas and copy the pixels
+                    const tempCanvas = document.createElement('canvas');
+                    tempCanvas.width = canvas.width;
+                    tempCanvas.height = canvas.height;
+                    const tempCtx = tempCanvas.getContext('2d');
+                    
+                    // Read pixels directly from WebGL
+                    const pixels = new Uint8Array(canvas.width * canvas.height * 4);
+                    gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+                    
+                    // Create ImageData from pixels
+                    const imageData = new ImageData(new Uint8ClampedArray(pixels), canvas.width, canvas.height);
+                    
+                    // Flip vertically (WebGL renders upside down)
+                    tempCtx.translate(0, canvas.height);
+                    tempCtx.scale(1, -1);
+                    tempCtx.putImageData(imageData, 0, 0);
+                    
+                    return tempCanvas.toDataURL(`image/${IMAGE_CAPTURE.format}`, IMAGE_CAPTURE.quality);
+                }
+            }
+            
+            // Try direct capture
+            const dataURL = canvas.toDataURL(`image/${IMAGE_CAPTURE.format}`, IMAGE_CAPTURE.quality);
+            
+            // Check if we got actual image data (not blank)
+            if (dataURL && dataURL.length > 1000) { // Increased threshold
+                // Quick check if it's not all black
+                const img = new Image();
+                img.src = dataURL;
+                return dataURL;
+            }
+            
+            console.log('⚠️ Direct capture returned empty/black image');
+            
+        } catch (error) {
+            console.error('❌ Canvas capture error:', error);
+        }
+        return null;
+    }
+
+    function saveImage(dataURL, gameToken, roundNumber) {
+        if (!dataURL) return false;
+        
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const filename = `geoguessr_${gameToken}_r${roundNumber}_${timestamp}.${IMAGE_CAPTURE.format}`;
+        
+        try {
+            // Use GM_download to save the image
+            GM_download({
+                url: dataURL,
+                name: filename,
+                saveAs: false // Auto-save to downloads folder
+            });
+            
+            console.log(`✅ Image saved: ${filename}`);
+            showNotification(`Image captured for round ${roundNumber}`, 'success');
+            return true;
+        } catch (error) {
+            console.error('❌ Image save error:', error);
+            return false;
+        }
+    }
+
+    // Debug function to capture ALL canvases
+    function captureAllCanvases() {
+        const canvases = document.querySelectorAll('canvas');
+        canvases.forEach((canvas, index) => {
+            if (canvas.width > 100 && canvas.height > 100) {
+                try {
+                    const dataURL = canvas.toDataURL('image/png', 1.0);
+                    if (dataURL && dataURL.length > 1000) {
+                        saveImage(dataURL, `CANVAS_TEST_${index}`, canvas.width);
+                        console.log(`✅ Saved canvas ${index}: ${canvas.width}x${canvas.height}`);
+                    } else {
+                        console.log(`❌ Canvas ${index} is blank/black`);
+                    }
+                } catch (e) {
+                    console.log(`❌ Canvas ${index} error:`, e.message);
+                }
+            }
+        });
+    }
+
+    // Test capture function for manual testing
+    function testImageCapture() {
+        console.log('🧪 Testing image capture...');
+        updateStatus('Testing image capture...');
+        
+        const canvas = findStreetViewCanvas();
+        
+        if (!canvas) {
+            showNotification('❌ No Street View canvas found', 'error');
+            updateStatus('Canvas not found');
+            return;
+        }
+        
+        console.log(`📐 Found canvas: ${canvas.width}x${canvas.height}`);
+        const dataURL = captureCanvas(canvas);
+        
+        if (dataURL) {
+            // For testing, save with a test filename
+            saveImage(dataURL, 'TEST', 0);
+            updateStatus('✅ Test capture successful!');
+            
+            // Optional: Show preview
+            if (IMAGE_CAPTURE.debugMode) {
+                showImagePreview(dataURL);
+            }
+        } else {
+            showNotification('❌ Failed to capture canvas', 'error');
+            updateStatus('Capture failed');
+        }
+    }
+
+    // Show a preview of captured image (for debugging)
+    function showImagePreview(dataURL) {
+        const preview = document.createElement('div');
+        preview.style.cssText = `
+            position: fixed;
+            bottom: 20px;
+            left: 20px;
+            z-index: 999999;
+            background: white;
+            padding: 10px;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            max-width: 300px;
+        `;
+        
+        const img = document.createElement('img');
+        img.src = dataURL;
+        img.style.cssText = 'width: 100%; border-radius: 4px;';
+        
+        const closeBtn = document.createElement('button');
+        closeBtn.textContent = 'Close Preview';
+        closeBtn.style.cssText = `
+            width: 100%;
+            margin-top: 10px;
+            padding: 5px;
+            background: #f44336;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        `;
+        closeBtn.onclick = () => preview.remove();
+        
+        preview.appendChild(img);
+        preview.appendChild(closeBtn);
+        document.body.appendChild(preview);
+        
+        // Auto-remove after 5 seconds
+        setTimeout(() => preview.remove(), 5000);
+    }
+
+    // Hook into guess submission
+    function initializeImageCapture() {
+        console.log('📸 Initializing image capture module...');
+        
+        // Monitor for guess button clicks
+        document.addEventListener('click', function(e) {
+            // Look for guess button (multiple possible selectors)
+            const guessButton = e.target.closest(
+                'button[data-qa="guess-button"], ' +
+                'button[class*="guess"], ' +
+                'button[class*="submit"], ' +
+                '.game-statuses__guess-button, ' +
+                '[class*="game-status"] button'
+            );
+            
+            if (guessButton && IMAGE_CAPTURE.enabled && !IMAGE_CAPTURE.capturedThisRound) {
+                console.log('🎯 Guess button clicked! Attempting capture...');
+                
+                // Small delay to ensure the guess is registered
+                setTimeout(() => {
+                    const canvas = findStreetViewCanvas();
+                    if (canvas && currentGameToken) {
+                        const dataURL = captureCanvas(canvas);
+                        if (dataURL) {
+                            // Determine round number (you may need to adjust this logic)
+                            const roundNumber = IMAGE_CAPTURE.currentRoundNumber + 1;
+                            saveImage(dataURL, currentGameToken, roundNumber);
+                            IMAGE_CAPTURE.capturedThisRound = true;
+                            IMAGE_CAPTURE.currentRoundNumber = roundNumber;
+                        }
+                    }
+                }, 100);
+            }
+        }, true); // Use capture phase to catch event early
+        
+        // Reset capture flag when new round starts
+        const observer = new MutationObserver(() => {
+            // Look for round change indicators
+            const roundIndicator = document.querySelector('[class*="round-result"], [class*="round-number"]');
+            if (roundIndicator) {
+                IMAGE_CAPTURE.capturedThisRound = false;
+            }
+        });
+        
+        observer.observe(document.body, { 
+            childList: true, 
+            subtree: true 
+        });
+    }
+
+    // ==================== END IMAGE CAPTURE MODULE ====================
 
     // Data storage
     let statsData = GM_getValue(CONFIG.STORAGE_KEY, []);
@@ -192,6 +456,12 @@
                 <button id="export-csv-btn">📥 Export to CSV</button>
                 <button id="import-recent-btn">📤 Import Recent Games</button>
                 <button id="test-api-btn">🔧 Test API Connection</button>
+                <button id="test-capture-btn">📸 Test Image Capture</button>
+                <button id="toggle-capture-btn">${IMAGE_CAPTURE.enabled ? '🔴' : '⚫'} ${IMAGE_CAPTURE.enabled ? 'Disable' : 'Enable'} Auto Capture</button>
+                <div id="capture-status" style="margin-top: 10px; padding: 5px; background: rgba(255,255,255,0.1); border-radius: 4px; font-size: 12px;">
+                    Image Capture: ${IMAGE_CAPTURE.enabled ? 'ON' : 'OFF'}
+                </div>
+                <button id="capture-all-btn">🔍 Capture All Canvases</button>
                 <button id="clear-data-btn">🗑️ Clear Data</button>
                 <button id="toggle-tracking-btn">⏸️ Pause Tracking</button>
                 <div id="stats-summary">
@@ -209,6 +479,9 @@
             document.getElementById('test-api-btn').addEventListener('click', testAPIConnection);
             document.getElementById('clear-data-btn').addEventListener('click', clearData);
             document.getElementById('toggle-tracking-btn').addEventListener('click', toggleTracking);
+            document.getElementById('test-capture-btn').addEventListener('click', testImageCapture);
+            document.getElementById('toggle-capture-btn').addEventListener('click', toggleImageCapture);
+            document.getElementById('capture-all-btn').addEventListener('click', captureAllCanvases);
 
             updateSummary();
             console.log('✅ Stats Tracker: UI created successfully!');
@@ -729,6 +1002,27 @@
         }
     }
 
+    function toggleImageCapture() {
+        IMAGE_CAPTURE.enabled = !IMAGE_CAPTURE.enabled;
+        GM_setValue('capture_images', IMAGE_CAPTURE.enabled);
+        
+        const btn = document.getElementById('toggle-capture-btn');
+        const status = document.getElementById('capture-status');
+        
+        if (btn) {
+            btn.innerHTML = `${IMAGE_CAPTURE.enabled ? '🔴' : '⚫'} ${IMAGE_CAPTURE.enabled ? 'Disable' : 'Enable'} Auto Capture`;
+        }
+        if (status) {
+            status.textContent = `Image Capture: ${IMAGE_CAPTURE.enabled ? 'ON' : 'OFF'}`;
+        }
+        
+        showNotification(`Image capture ${IMAGE_CAPTURE.enabled ? 'enabled' : 'disabled'}`, 'info');
+        
+        if (IMAGE_CAPTURE.enabled) {
+            initializeImageCapture();
+        }
+    }
+
     // Utility function for delays
     function delay(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
@@ -740,6 +1034,11 @@
 
         // Try to create UI immediately
         createUI();
+
+        // Check of image capture is enabled
+        if (IMAGE_CAPTURE.enabled) {
+            initializeImageCapture();
+        }
 
         // Start monitoring
         startUrlMonitoring();

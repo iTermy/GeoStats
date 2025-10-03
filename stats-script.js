@@ -43,6 +43,299 @@
         debugMode: true // Set to false once working
     };
 
+    const SCREEN_CAPTURE = {
+        stream: null,
+        video: null,
+        enabled: false,
+        captureOnGuess: GM_getValue('capture_on_guess', true),
+        cropToGame: true
+    };
+    
+    // Initialize screen capture (user must click button to grant permission)
+    async function initializeScreenCapture() {
+        console.log('📺 Requesting screen capture permission...');
+        updateStatus('Requesting screen share...');
+        
+        try {
+            // Request screen capture with specific options
+            const stream = await navigator.mediaDevices.getDisplayMedia({
+                video: {
+                    cursor: "never", // Don't include cursor
+                    displaySurface: "browser" // Prefer current browser tab
+                },
+                audio: false
+            });
+            
+            // Create hidden video element
+            const video = document.createElement('video');
+            video.style.display = 'none';
+            video.autoplay = true;
+            video.playsInline = true;
+            video.srcObject = stream;
+            document.body.appendChild(video);
+            
+            // Wait for video to be ready
+            await new Promise((resolve) => {
+                video.onloadedmetadata = resolve;
+            });
+            await video.play();
+            
+            // Store references
+            SCREEN_CAPTURE.stream = stream;
+            SCREEN_CAPTURE.video = video;
+            SCREEN_CAPTURE.enabled = true;
+            
+            // Handle stream end (user stopped sharing)
+            stream.getTracks()[0].onended = () => {
+                console.log('⚠️ Screen sharing stopped');
+                SCREEN_CAPTURE.enabled = false;
+                SCREEN_CAPTURE.stream = null;
+                SCREEN_CAPTURE.video = null;
+                updateScreenCaptureUI();
+                showNotification('Screen sharing stopped', 'warning');
+            };
+            
+            console.log('✅ Screen capture initialized successfully');
+            updateStatus('Screen capture ready!');
+            showNotification('Screen capture enabled! Keep this tab visible during games.', 'success');
+            updateScreenCaptureUI();
+            
+            // Set up automatic capture on guess if enabled
+            if (SCREEN_CAPTURE.captureOnGuess) {
+                setupAutomaticCapture();
+            }
+            
+            return true;
+        } catch (err) {
+            console.error('❌ Screen capture failed:', err);
+            if (err.name === 'NotAllowedError') {
+                showNotification('Screen capture permission denied', 'error');
+            } else {
+                showNotification('Screen capture failed: ' + err.message, 'error');
+            }
+            updateStatus('Screen capture failed');
+            return false;
+        }
+    }
+
+    // Capture current screen
+    function captureScreenNow(gameToken = 'MANUAL', roundNumber = 0) {
+        if (!SCREEN_CAPTURE.enabled || !SCREEN_CAPTURE.video) {
+            console.log('❌ Screen capture not initialized');
+            showNotification('Please enable screen capture first', 'warning');
+            return false;
+        }
+        
+        const video = SCREEN_CAPTURE.video;
+        
+        try {
+            // Create canvas at video resolution
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            const ctx = canvas.getContext('2d');
+            
+            // Draw current video frame
+            ctx.drawImage(video, 0, 0);
+            
+            let finalDataURL;
+            
+            if (SCREEN_CAPTURE.cropToGame) {
+                // Try to crop to game area
+                finalDataURL = cropToGameArea(canvas);
+            } else {
+                // Use full screen
+                finalDataURL = canvas.toDataURL('image/jpeg', 0.9);
+            }
+            
+            if (finalDataURL && finalDataURL.length > 1000) {
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                const filename = `geoguessr_${gameToken}_r${roundNumber}_${timestamp}.jpeg`;
+                
+                GM_download({
+                    url: finalDataURL,
+                    name: filename,
+                    saveAs: false
+                });
+                
+                console.log(`✅ Screen captured: ${filename}`);
+                showNotification(`Captured round ${roundNumber}`, 'success');
+                
+                // Show preview if in debug mode
+                if (IMAGE_CAPTURE.debugMode) {
+                    showImagePreview(finalDataURL);
+                }
+                
+                return true;
+            }
+        } catch (err) {
+            console.error('❌ Capture error:', err);
+            showNotification('Capture failed: ' + err.message, 'error');
+        }
+        
+        return false;
+    }
+
+    // Crop canvas to game area
+    function cropToGameArea(canvas) {
+        // Find game area - try multiple selectors
+        const gameElement = document.querySelector(
+            '.game_layout__GWLms, ' +
+            '[class*="game_layout"], ' +
+            '[class*="game-layout"], ' +
+            '.game-area, ' +
+            '.main-content__Qppzr, ' +
+            '[class*="main-content"], ' +
+            '#__next main'
+        );
+        
+        if (!gameElement) {
+            console.log('⚠️ Could not find game area, using full screen');
+            return canvas.toDataURL('image/jpeg', 0.9);
+        }
+        
+        const bounds = gameElement.getBoundingClientRect();
+        const scaleX = canvas.width / window.innerWidth;
+        const scaleY = canvas.height / window.innerHeight;
+        
+        // Calculate crop coordinates
+        const cropX = Math.max(0, bounds.left * scaleX);
+        const cropY = Math.max(0, bounds.top * scaleY);
+        const cropWidth = Math.min(canvas.width - cropX, bounds.width * scaleX);
+        const cropHeight = Math.min(canvas.height - cropY, bounds.height * scaleY);
+        
+        // Create cropped canvas
+        const croppedCanvas = document.createElement('canvas');
+        croppedCanvas.width = cropWidth;
+        croppedCanvas.height = cropHeight;
+        const ctx = croppedCanvas.getContext('2d');
+        
+        ctx.drawImage(
+            canvas,
+            cropX, cropY, cropWidth, cropHeight,
+            0, 0, cropWidth, cropHeight
+        );
+        
+        console.log(`📐 Cropped from ${canvas.width}x${canvas.height} to ${cropWidth}x${cropHeight}`);
+        
+        return croppedCanvas.toDataURL('image/jpeg', 0.9);
+    }
+
+    // Set up automatic capture on guess button click
+    function setupAutomaticCapture() {
+        console.log('🎯 Setting up automatic capture on guess...');
+        
+        // Listen for clicks on the document
+        document.addEventListener('click', function(e) {
+            // Check if this is a guess button
+            const guessButton = e.target.closest(
+                'button[data-qa="guess-button"], ' +
+                'button[class*="guess"], ' +
+                'button[class*="submit"], ' +
+                'div[class*="round-result_actions"] button, ' +
+                '.game-statuses_section__8rN3e button'
+            );
+            
+            if (guessButton && SCREEN_CAPTURE.enabled && SCREEN_CAPTURE.captureOnGuess) {
+                const buttonText = guessButton.textContent.toLowerCase();
+                
+                // Make sure it's actually the guess button
+                if (buttonText.includes('guess') || buttonText.includes('submit')) {
+                    console.log('🎯 Guess button clicked! Capturing in 100ms...');
+                    
+                    // Small delay to ensure guess is registered
+                    setTimeout(() => {
+                        if (currentGameToken) {
+                            const roundNumber = detectCurrentRound();
+                            captureScreenNow(currentGameToken, roundNumber);
+                        } else {
+                            captureScreenNow('GUESS', 1);
+                        }
+                    }, 100);
+                }
+            }
+        }, true); // Use capture phase
+    }
+
+    // Try to detect current round number
+    function detectCurrentRound() {
+        // Look for round indicator
+        const roundElements = document.querySelectorAll(
+            '[class*="round-number"], ' +
+            '[class*="round_number"], ' +
+            '[class*="game-statuses_round"], ' +
+            '.game-statuses_section__8rN3e'
+        );
+        
+        for (const elem of roundElements) {
+            const text = elem.textContent;
+            const match = text.match(/round\s*(\d+)/i);
+            if (match) {
+                return parseInt(match[1]);
+            }
+            // Also check for "1/5" format
+            const match2 = text.match(/(\d+)\s*\/\s*\d+/);
+            if (match2) {
+                return parseInt(match2[1]);
+            }
+        }
+        
+        // Default to incrementing counter
+        IMAGE_CAPTURE.currentRoundNumber++;
+        return IMAGE_CAPTURE.currentRoundNumber;
+    }
+
+    // Update UI for screen capture
+    function updateScreenCaptureUI() {
+        const btn = document.getElementById('enable-screen-capture-btn');
+        if (btn) {
+            if (SCREEN_CAPTURE.enabled) {
+                btn.innerHTML = '🔴 Stop Screen Capture';
+                btn.style.background = '#f44336';
+            } else {
+                btn.innerHTML = '🖥️ Enable Screen Capture';
+                btn.style.background = '#4CAF50';
+            }
+        }
+        
+        const status = document.getElementById('screen-capture-status');
+        if (status) {
+            status.innerHTML = `Screen Capture: <strong>${SCREEN_CAPTURE.enabled ? 'ACTIVE' : 'INACTIVE'}</strong>`;
+            status.style.color = SCREEN_CAPTURE.enabled ? '#4CAF50' : '#f44336';
+        }
+    }
+
+    // Toggle screen capture
+    async function toggleScreenCapture() {
+        if (SCREEN_CAPTURE.enabled) {
+            // Stop screen capture
+            if (SCREEN_CAPTURE.stream) {
+                SCREEN_CAPTURE.stream.getTracks().forEach(track => track.stop());
+            }
+            if (SCREEN_CAPTURE.video) {
+                SCREEN_CAPTURE.video.remove();
+            }
+            SCREEN_CAPTURE.enabled = false;
+            SCREEN_CAPTURE.stream = null;
+            SCREEN_CAPTURE.video = null;
+            updateScreenCaptureUI();
+            showNotification('Screen capture stopped', 'info');
+        } else {
+            // Start screen capture
+            await initializeScreenCapture();
+        }
+    }
+
+    // Manual capture button handler
+    function manualScreenCapture() {
+        if (!SCREEN_CAPTURE.enabled) {
+            showNotification('Please enable screen capture first', 'warning');
+            return;
+        }
+        
+        captureScreenNow('MANUAL', Date.now());
+    }
+
     // Canvas detection and capture functions
     function findStreetViewCanvas() {
         const canvases = document.querySelectorAll('canvas');
@@ -172,6 +465,30 @@
         });
     }
 
+    function tryAllCaptureMethods() {
+        console.log('🚀 Trying all capture methods...');
+        
+        // 1. Investigate structure
+        investigateStreetView();
+        
+        // 2. Try DOM screenshot
+        setTimeout(() => captureUsingDOMScreenshot(), 500);
+        
+        // 3. Try intercepting images
+        setTimeout(() => interceptImageLoads(), 1000);
+        
+        // 4. Try browser screenshot (will ask for permission)
+        // setTimeout(() => requestBrowserScreenshot(), 1500);
+        
+        // 5. Check for Street View API
+        setTimeout(() => {
+            if (window.google && window.google.maps) {
+                console.log('Google Maps API available:', Object.keys(window.google.maps));
+            }
+        }, 2000);
+    }
+
+
     // Test capture function for manual testing
     function testImageCapture() {
         console.log('🧪 Testing image capture...');
@@ -202,6 +519,170 @@
             updateStatus('Capture failed');
         }
     }
+
+    // Alternative approach: Use html2canvas library or browser screenshot
+// First, let's try to find if Street View is in an iframe or shadow DOM
+
+function investigateStreetView() {
+    console.log('🔍 Investigating Street View rendering...');
+    
+    // Check for iframes
+    const iframes = document.querySelectorAll('iframe');
+    console.log(`Found ${iframes.length} iframes:`);
+    iframes.forEach((iframe, i) => {
+        console.log(`  iframe ${i}: ${iframe.src || 'no src'}, size: ${iframe.width}x${iframe.height}`);
+    });
+    
+    // Check for shadow roots
+    const allElements = document.querySelectorAll('*');
+    let shadowCount = 0;
+    allElements.forEach(el => {
+        if (el.shadowRoot) {
+            shadowCount++;
+            console.log(`Shadow root found on:`, el.tagName, el.className);
+        }
+    });
+    console.log(`Total shadow roots: ${shadowCount}`);
+    
+    // Look for Google Maps specific elements
+    const mapElements = document.querySelectorAll('[class*="gm-"], [class*="widget-scene"], [class*="panorama"]');
+    console.log(`Found ${mapElements.length} map-related elements`);
+    
+    // Check if there's a WebGL context we're missing
+    const allCanvases = document.querySelectorAll('canvas');
+    allCanvases.forEach((canvas, i) => {
+        const gl = canvas.getContext('webgl') || canvas.getContext('webgl2');
+        if (gl) {
+            const attrs = gl.getContextAttributes();
+            console.log(`Canvas ${i} WebGL attributes:`, attrs);
+        }
+    });
+}
+
+// Completely different approach: Use DOM screenshot
+function captureUsingDOMScreenshot() {
+    console.log('📸 Attempting DOM screenshot...');
+    
+    // Find the game container
+    const gameContainer = document.querySelector('.game_layout__gameCanvas, .game-layout__canvas, [class*="game_page"], .main-content');
+    
+    if (!gameContainer) {
+        console.log('❌ Game container not found');
+        return;
+    }
+    
+    // Method 1: Use getScreenshot if available (some browsers)
+    if (gameContainer.getScreenshot) {
+        gameContainer.getScreenshot().then(blob => {
+            const url = URL.createObjectURL(blob);
+            saveImage(url, 'DOM_SCREENSHOT', 1);
+        });
+    }
+    
+    // Method 2: Create a foreign object SVG (works sometimes)
+    const bounds = gameContainer.getBoundingClientRect();
+    const width = bounds.width;
+    const height = bounds.height;
+    
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    
+    const data = `
+        <svg xmlns='http://www.w3.org/2000/svg' width='${width}' height='${height}'>
+            <foreignObject width='100%' height='100%'>
+                <div xmlns='http://www.w3.org/1999/xhtml'>
+                    ${gameContainer.innerHTML}
+                </div>
+            </foreignObject>
+        </svg>
+    `;
+    
+    const img = new Image();
+    const svg = new Blob([data], {type: 'image/svg+xml;charset=utf-8'});
+    const url = URL.createObjectURL(svg);
+    
+    img.onload = function() {
+        ctx.drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+        const dataURL = canvas.toDataURL('image/jpeg', 0.8);
+        if (dataURL) {
+            saveImage(dataURL, 'SVG_CAPTURE', 1);
+        }
+    };
+    img.src = url;
+}
+
+// Nuclear option: Use browser's built-in screenshot capability
+function requestBrowserScreenshot() {
+    console.log('🖼️ Requesting browser screenshot...');
+    
+    // This requires special permissions but Tampermonkey might allow it
+    if (navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) {
+        navigator.mediaDevices.getDisplayMedia({
+            video: {
+                width: 1920,
+                height: 1080
+            }
+        }).then(stream => {
+            const video = document.createElement('video');
+            video.srcObject = stream;
+            video.play();
+            
+            video.onloadedmetadata = () => {
+                const canvas = document.createElement('canvas');
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                const ctx = canvas.getContext('2d');
+                
+                // Wait a bit for video to be ready
+                setTimeout(() => {
+                    ctx.drawImage(video, 0, 0);
+                    const dataURL = canvas.toDataURL('image/jpeg', 0.8);
+                    
+                    // Stop the stream
+                    stream.getTracks().forEach(track => track.stop());
+                    
+                    if (dataURL) {
+                        saveImage(dataURL, 'SCREEN_CAPTURE', 1);
+                        showImagePreview(dataURL);
+                    }
+                }, 100);
+            };
+        }).catch(err => {
+            console.error('Screen capture denied:', err);
+        });
+    }
+}
+
+// Let's also try intercepting image loads
+function interceptImageLoads() {
+    console.log('🎣 Intercepting image loads...');
+    
+    const originalImage = window.Image;
+    window.Image = function() {
+        const img = new originalImage();
+        const originalSrc = img.__lookupSetter__('src');
+        
+        img.__defineSetter__('src', function(value) {
+            if (value && value.includes('streetview') || value.includes('cbk')) {
+                console.log('🗺️ Street View tile detected:', value.substring(0, 100));
+            }
+            originalSrc.call(this, value);
+        });
+        
+        return img;
+    };
+    
+    // Also check existing images
+    const images = document.querySelectorAll('img');
+    images.forEach(img => {
+        if (img.src && (img.src.includes('streetview') || img.src.includes('cbk'))) {
+            console.log('Found Street View image:', img.src.substring(0, 100));
+        }
+    });
+}
 
     // Show a preview of captured image (for debugging)
     function showImagePreview(dataURL) {
@@ -456,12 +937,19 @@
                 <button id="export-csv-btn">📥 Export to CSV</button>
                 <button id="import-recent-btn">📤 Import Recent Games</button>
                 <button id="test-api-btn">🔧 Test API Connection</button>
-                <button id="test-capture-btn">📸 Test Image Capture</button>
-                <button id="toggle-capture-btn">${IMAGE_CAPTURE.enabled ? '🔴' : '⚫'} ${IMAGE_CAPTURE.enabled ? 'Disable' : 'Enable'} Auto Capture</button>
-                <div id="capture-status" style="margin-top: 10px; padding: 5px; background: rgba(255,255,255,0.1); border-radius: 4px; font-size: 12px;">
-                    Image Capture: ${IMAGE_CAPTURE.enabled ? 'ON' : 'OFF'}
+                
+                <div style="border-top: 1px solid rgba(255,255,255,0.2); margin: 10px 0; padding-top: 10px;">
+                    <h4 style="margin: 0 0 10px 0; color: #4CAF50; font-size: 14px;">📸 Image Capture</h4>
+                    <div id="screen-capture-status" style="margin-bottom: 10px; font-size: 12px;">
+                        Screen Capture: <strong>INACTIVE</strong>
+                    </div>
+                    <button id="enable-screen-capture-btn">🖥️ Enable Screen Capture</button>
+                    <button id="manual-capture-btn">📸 Capture Now</button>
+                    <button id="toggle-auto-capture-btn">
+                        ${SCREEN_CAPTURE.captureOnGuess ? '⏸️ Disable' : '▶️ Enable'} Auto-Capture
+                    </button>
                 </div>
-                <button id="capture-all-btn">🔍 Capture All Canvases</button>
+                
                 <button id="clear-data-btn">🗑️ Clear Data</button>
                 <button id="toggle-tracking-btn">⏸️ Pause Tracking</button>
                 <div id="stats-summary">
@@ -482,6 +970,19 @@
             document.getElementById('test-capture-btn').addEventListener('click', testImageCapture);
             document.getElementById('toggle-capture-btn').addEventListener('click', toggleImageCapture);
             document.getElementById('capture-all-btn').addEventListener('click', captureAllCanvases);
+            document.getElementById('try-all-capture-btn').addEventListener('click', tryAllCaptureMethods);
+            document.getElementById('enable-screen-capture-btn').addEventListener('click', toggleScreenCapture);
+            document.getElementById('manual-capture-btn').addEventListener('click', manualScreenCapture);
+            document.getElementById('toggle-auto-capture-btn').addEventListener('click', () => {
+                SCREEN_CAPTURE.captureOnGuess = !SCREEN_CAPTURE.captureOnGuess;
+                GM_setValue('capture_on_guess', SCREEN_CAPTURE.captureOnGuess);
+                document.getElementById('toggle-auto-capture-btn').innerHTML = 
+                    `${SCREEN_CAPTURE.captureOnGuess ? '⏸️ Disable' : '▶️ Enable'} Auto-Capture`;
+                showNotification(`Auto-capture ${SCREEN_CAPTURE.captureOnGuess ? 'enabled' : 'disabled'}`, 'info');
+                if (SCREEN_CAPTURE.captureOnGuess && SCREEN_CAPTURE.enabled) {
+                    setupAutomaticCapture();
+                }
+            });
 
             updateSummary();
             console.log('✅ Stats Tracker: UI created successfully!');

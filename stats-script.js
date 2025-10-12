@@ -1,19 +1,15 @@
 // ==UserScript==
 // @name         GeoGuessr Stats Tracker
 // @namespace    http://tampermonkey.net/
-// @version      2.1
-// @description  Track your GeoGuessr performance with detailed statistics
+// @version      3.1
+// @description  Track your GeoGuessr game performance and export statistics
 // @author       You
 // @match        https://www.geoguessr.com/*
 // @match        https://geoguessr.com/*
-// @match        http://www.geoguessr.com/*
-// @match        http://geoguessr.com/*
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
-// @grant        unsafeWindow
-// @grant        GM_download
 // @connect      www.geoguessr.com
 // @connect      geoguessr.com
 // @run-at       document-idle
@@ -22,1091 +18,93 @@
 (function() {
     'use strict';
 
-    // Immediate console log to verify script is loading
-    console.log('%c🎯 GeoGuessr Stats Tracker: Script injected!', 'color: #4CAF50; font-weight: bold; font-size: 14px');
-    console.log('Current URL:', window.location.href);
-    console.log('Document ready state:', document.readyState);
+    console.log('%c📊 GeoGuessr Stats Tracker v3.1 Loaded!', 'color: #4CAF50; font-weight: bold; font-size: 14px');
 
-    // Configuration
+    // ==================== CONFIGURATION ====================
     const CONFIG = {
         CHECK_INTERVAL: 5000,
         STORAGE_KEY: 'geoguessr_stats_data'
     };
 
-    // ==================== IMAGE CAPTURE MODULE ====================
-    const IMAGE_CAPTURE = {
-        enabled: GM_getValue('capture_images', false),
-        quality: GM_getValue('image_quality', 0.8),
-        format: 'jpeg',
-        capturedThisRound: false,
-        currentRoundNumber: 0,
-        debugMode: true // Set to false once working
-    };
-
-    const SCREEN_CAPTURE = {
-        stream: null,
-        video: null,
-        enabled: false,
-        captureOnGuess: GM_getValue('capture_on_guess', true),
-        cropToGame: true
-    };
-    
-    // Initialize screen capture (user must click button to grant permission)
-    async function initializeScreenCapture() {
-        console.log('📺 Requesting screen capture permission...');
-        updateStatus('Requesting screen share...');
-        
-        try {
-            // Request screen capture with specific options
-            const stream = await navigator.mediaDevices.getDisplayMedia({
-                video: {
-                    cursor: "never", // Don't include cursor
-                    displaySurface: "browser" // Prefer current browser tab
-                },
-                audio: false
-            });
-            
-            // Create hidden video element
-            const video = document.createElement('video');
-            video.style.display = 'none';
-            video.autoplay = true;
-            video.playsInline = true;
-            video.srcObject = stream;
-            document.body.appendChild(video);
-            
-            // Wait for video to be ready
-            await new Promise((resolve) => {
-                video.onloadedmetadata = resolve;
-            });
-            await video.play();
-            
-            // Store references
-            SCREEN_CAPTURE.stream = stream;
-            SCREEN_CAPTURE.video = video;
-            SCREEN_CAPTURE.enabled = true;
-            
-            // Handle stream end (user stopped sharing)
-            stream.getTracks()[0].onended = () => {
-                console.log('⚠️ Screen sharing stopped');
-                SCREEN_CAPTURE.enabled = false;
-                SCREEN_CAPTURE.stream = null;
-                SCREEN_CAPTURE.video = null;
-                updateScreenCaptureUI();
-                showNotification('Screen sharing stopped', 'warning');
-            };
-            
-            console.log('✅ Screen capture initialized successfully');
-            updateStatus('Screen capture ready!');
-            showNotification('Screen capture enabled! Keep this tab visible during games.', 'success');
-            updateScreenCaptureUI();
-            
-            // Set up automatic capture on guess if enabled
-            if (SCREEN_CAPTURE.captureOnGuess) {
-                setupAutomaticCapture();
-            }
-            
-            return true;
-        } catch (err) {
-            console.error('❌ Screen capture failed:', err);
-            if (err.name === 'NotAllowedError') {
-                showNotification('Screen capture permission denied', 'error');
-            } else {
-                showNotification('Screen capture failed: ' + err.message, 'error');
-            }
-            updateStatus('Screen capture failed');
-            return false;
-        }
-    }
-
-    // Capture current screen
-    function captureScreenNow(gameToken = 'MANUAL', roundNumber = 0) {
-        if (!SCREEN_CAPTURE.enabled || !SCREEN_CAPTURE.video) {
-            console.log('❌ Screen capture not initialized');
-            showNotification('Please enable screen capture first', 'warning');
-            return false;
-        }
-        
-        const video = SCREEN_CAPTURE.video;
-        
-        try {
-            // Create canvas at video resolution
-            const canvas = document.createElement('canvas');
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            const ctx = canvas.getContext('2d');
-            
-            // Draw current video frame
-            ctx.drawImage(video, 0, 0);
-            
-            let finalDataURL;
-            
-            if (SCREEN_CAPTURE.cropToGame) {
-                // Try to crop to game area
-                finalDataURL = cropToGameArea(canvas);
-            } else {
-                // Use full screen
-                finalDataURL = canvas.toDataURL('image/jpeg', 0.9);
-            }
-            
-            if (finalDataURL && finalDataURL.length > 1000) {
-                const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-                const filename = `geoguessr_${gameToken}_r${roundNumber}_${timestamp}.jpeg`;
-                
-                GM_download({
-                    url: finalDataURL,
-                    name: filename,
-                    saveAs: false
-                });
-                
-                console.log(`✅ Screen captured: ${filename}`);
-                showNotification(`Captured round ${roundNumber}`, 'success');
-                
-                // Show preview if in debug mode
-                if (IMAGE_CAPTURE.debugMode) {
-                    showImagePreview(finalDataURL);
-                }
-                
-                return true;
-            }
-        } catch (err) {
-            console.error('❌ Capture error:', err);
-            showNotification('Capture failed: ' + err.message, 'error');
-        }
-        
-        return false;
-    }
-
-    // Crop canvas to game area
-    function cropToGameArea(canvas) {
-        // Find game area - try multiple selectors
-        const gameElement = document.querySelector(
-            '.game_layout__GWLms, ' +
-            '[class*="game_layout"], ' +
-            '[class*="game-layout"], ' +
-            '.game-area, ' +
-            '.main-content__Qppzr, ' +
-            '[class*="main-content"], ' +
-            '#__next main'
-        );
-        
-        if (!gameElement) {
-            console.log('⚠️ Could not find game area, using full screen');
-            return canvas.toDataURL('image/jpeg', 0.9);
-        }
-        
-        const bounds = gameElement.getBoundingClientRect();
-        const scaleX = canvas.width / window.innerWidth;
-        const scaleY = canvas.height / window.innerHeight;
-        
-        // Calculate crop coordinates
-        const cropX = Math.max(0, bounds.left * scaleX);
-        const cropY = Math.max(0, bounds.top * scaleY);
-        const cropWidth = Math.min(canvas.width - cropX, bounds.width * scaleX);
-        const cropHeight = Math.min(canvas.height - cropY, bounds.height * scaleY);
-        
-        // Create cropped canvas
-        const croppedCanvas = document.createElement('canvas');
-        croppedCanvas.width = cropWidth;
-        croppedCanvas.height = cropHeight;
-        const ctx = croppedCanvas.getContext('2d');
-        
-        ctx.drawImage(
-            canvas,
-            cropX, cropY, cropWidth, cropHeight,
-            0, 0, cropWidth, cropHeight
-        );
-        
-        console.log(`📐 Cropped from ${canvas.width}x${canvas.height} to ${cropWidth}x${cropHeight}`);
-        
-        return croppedCanvas.toDataURL('image/jpeg', 0.9);
-    }
-
-    // Set up automatic capture on guess button click
-    function setupAutomaticCapture() {
-        console.log('🎯 Setting up automatic capture on guess...');
-        
-        // Listen for clicks on the document
-        document.addEventListener('click', function(e) {
-            // Check if this is a guess button
-            const guessButton = e.target.closest(
-                'button[data-qa="guess-button"], ' +
-                'button[class*="guess"], ' +
-                'button[class*="submit"], ' +
-                'div[class*="round-result_actions"] button, ' +
-                '.game-statuses_section__8rN3e button'
-            );
-            
-            if (guessButton && SCREEN_CAPTURE.enabled && SCREEN_CAPTURE.captureOnGuess) {
-                const buttonText = guessButton.textContent.toLowerCase();
-                
-                // Make sure it's actually the guess button
-                if (buttonText.includes('guess') || buttonText.includes('submit')) {
-                    console.log('🎯 Guess button clicked! Capturing in 100ms...');
-                    
-                    // Small delay to ensure guess is registered
-                    setTimeout(() => {
-                        if (currentGameToken) {
-                            const roundNumber = detectCurrentRound();
-                            captureScreenNow(currentGameToken, roundNumber);
-                        } else {
-                            captureScreenNow('GUESS', 1);
-                        }
-                    }, 100);
-                }
-            }
-        }, true); // Use capture phase
-    }
-
-    // Try to detect current round number
-    function detectCurrentRound() {
-        // Look for round indicator
-        const roundElements = document.querySelectorAll(
-            '[class*="round-number"], ' +
-            '[class*="round_number"], ' +
-            '[class*="game-statuses_round"], ' +
-            '.game-statuses_section__8rN3e'
-        );
-        
-        for (const elem of roundElements) {
-            const text = elem.textContent;
-            const match = text.match(/round\s*(\d+)/i);
-            if (match) {
-                return parseInt(match[1]);
-            }
-            // Also check for "1/5" format
-            const match2 = text.match(/(\d+)\s*\/\s*\d+/);
-            if (match2) {
-                return parseInt(match2[1]);
-            }
-        }
-        
-        // Default to incrementing counter
-        IMAGE_CAPTURE.currentRoundNumber++;
-        return IMAGE_CAPTURE.currentRoundNumber;
-    }
-
-    // Update UI for screen capture
-    function updateScreenCaptureUI() {
-        const btn = document.getElementById('enable-screen-capture-btn');
-        if (btn) {
-            if (SCREEN_CAPTURE.enabled) {
-                btn.innerHTML = '🔴 Stop Screen Capture';
-                btn.style.background = '#f44336';
-            } else {
-                btn.innerHTML = '🖥️ Enable Screen Capture';
-                btn.style.background = '#4CAF50';
-            }
-        }
-        
-        const status = document.getElementById('screen-capture-status');
-        if (status) {
-            status.innerHTML = `Screen Capture: <strong>${SCREEN_CAPTURE.enabled ? 'ACTIVE' : 'INACTIVE'}</strong>`;
-            status.style.color = SCREEN_CAPTURE.enabled ? '#4CAF50' : '#f44336';
-        }
-    }
-
-    // Toggle screen capture
-    async function toggleScreenCapture() {
-        if (SCREEN_CAPTURE.enabled) {
-            // Stop screen capture
-            if (SCREEN_CAPTURE.stream) {
-                SCREEN_CAPTURE.stream.getTracks().forEach(track => track.stop());
-            }
-            if (SCREEN_CAPTURE.video) {
-                SCREEN_CAPTURE.video.remove();
-            }
-            SCREEN_CAPTURE.enabled = false;
-            SCREEN_CAPTURE.stream = null;
-            SCREEN_CAPTURE.video = null;
-            updateScreenCaptureUI();
-            showNotification('Screen capture stopped', 'info');
-        } else {
-            // Start screen capture
-            await initializeScreenCapture();
-        }
-    }
-
-    // Manual capture button handler
-    function manualScreenCapture() {
-        if (!SCREEN_CAPTURE.enabled) {
-            showNotification('Please enable screen capture first', 'warning');
-            return;
-        }
-        
-        captureScreenNow('MANUAL', Date.now());
-    }
-
-    // Canvas detection and capture functions
-    function findStreetViewCanvas() {
-        const canvases = document.querySelectorAll('canvas');
-        
-        if (IMAGE_CAPTURE.debugMode) {
-            console.log(`🖼️ Found ${canvases.length} canvases on page:`);
-            canvases.forEach((canvas, index) => {
-                console.log(`  Canvas ${index}: ${canvas.width}x${canvas.height}, parent: ${canvas.parentElement?.className}`);
-            });
-        }
-        
-        // Strategy 1: Find the largest canvas (usually Street View)
-        const largeCanvases = Array.from(canvases)
-            .filter(c => c.width >= 500 && c.height >= 400)
-            .sort((a, b) => (b.width * b.height) - (a.width * a.height));
-        
-        if (largeCanvases.length > 0) {
-            // Street View is typically the largest or second-largest canvas
-            // Sometimes UI overlay is on top
-            return largeCanvases[0];
-        }
-        
-        // Strategy 2: Look for canvas in specific game container
-        const gameCanvas = document.querySelector('.game_canvas canvas, .game-layout__canvas canvas, [class*="game"] canvas');
-        if (gameCanvas && gameCanvas.width > 400) {
-            return gameCanvas;
-        }
-        
-        return null;
-    }
-
-    function captureCanvas(canvas) {
-        try {
-            // First, check if this is a WebGL canvas
-            const gl = canvas.getContext('webgl', { preserveDrawingBuffer: true }) || 
-                    canvas.getContext('webgl2', { preserveDrawingBuffer: true }) || 
-                    canvas.getContext('experimental-webgl', { preserveDrawingBuffer: true });
-            
-            if (gl) {
-                console.log('🎨 WebGL context detected');
-                
-                // Method 1: Try to force preserve the drawing buffer
-                if (!gl.getContextAttributes().preserveDrawingBuffer) {
-                    console.log('⚠️ Drawing buffer not preserved, attempting workaround...');
-                    
-                    // Create a new canvas and copy the pixels
-                    const tempCanvas = document.createElement('canvas');
-                    tempCanvas.width = canvas.width;
-                    tempCanvas.height = canvas.height;
-                    const tempCtx = tempCanvas.getContext('2d');
-                    
-                    // Read pixels directly from WebGL
-                    const pixels = new Uint8Array(canvas.width * canvas.height * 4);
-                    gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
-                    
-                    // Create ImageData from pixels
-                    const imageData = new ImageData(new Uint8ClampedArray(pixels), canvas.width, canvas.height);
-                    
-                    // Flip vertically (WebGL renders upside down)
-                    tempCtx.translate(0, canvas.height);
-                    tempCtx.scale(1, -1);
-                    tempCtx.putImageData(imageData, 0, 0);
-                    
-                    return tempCanvas.toDataURL(`image/${IMAGE_CAPTURE.format}`, IMAGE_CAPTURE.quality);
-                }
-            }
-            
-            // Try direct capture
-            const dataURL = canvas.toDataURL(`image/${IMAGE_CAPTURE.format}`, IMAGE_CAPTURE.quality);
-            
-            // Check if we got actual image data (not blank)
-            if (dataURL && dataURL.length > 1000) { // Increased threshold
-                // Quick check if it's not all black
-                const img = new Image();
-                img.src = dataURL;
-                return dataURL;
-            }
-            
-            console.log('⚠️ Direct capture returned empty/black image');
-            
-        } catch (error) {
-            console.error('❌ Canvas capture error:', error);
-        }
-        return null;
-    }
-
-    function saveImage(dataURL, gameToken, roundNumber) {
-        if (!dataURL) return false;
-        
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const filename = `geoguessr_${gameToken}_r${roundNumber}_${timestamp}.${IMAGE_CAPTURE.format}`;
-        
-        try {
-            // Use GM_download to save the image
-            GM_download({
-                url: dataURL,
-                name: filename,
-                saveAs: false // Auto-save to downloads folder
-            });
-            
-            console.log(`✅ Image saved: ${filename}`);
-            showNotification(`Image captured for round ${roundNumber}`, 'success');
-            return true;
-        } catch (error) {
-            console.error('❌ Image save error:', error);
-            return false;
-        }
-    }
-
-    // Debug function to capture ALL canvases
-    function captureAllCanvases() {
-        const canvases = document.querySelectorAll('canvas');
-        canvases.forEach((canvas, index) => {
-            if (canvas.width > 100 && canvas.height > 100) {
-                try {
-                    const dataURL = canvas.toDataURL('image/png', 1.0);
-                    if (dataURL && dataURL.length > 1000) {
-                        saveImage(dataURL, `CANVAS_TEST_${index}`, canvas.width);
-                        console.log(`✅ Saved canvas ${index}: ${canvas.width}x${canvas.height}`);
-                    } else {
-                        console.log(`❌ Canvas ${index} is blank/black`);
-                    }
-                } catch (e) {
-                    console.log(`❌ Canvas ${index} error:`, e.message);
-                }
-            }
-        });
-    }
-
-    function tryAllCaptureMethods() {
-        console.log('🚀 Trying all capture methods...');
-        
-        // 1. Investigate structure
-        investigateStreetView();
-        
-        // 2. Try DOM screenshot
-        setTimeout(() => captureUsingDOMScreenshot(), 500);
-        
-        // 3. Try intercepting images
-        setTimeout(() => interceptImageLoads(), 1000);
-        
-        // 4. Try browser screenshot (will ask for permission)
-        // setTimeout(() => requestBrowserScreenshot(), 1500);
-        
-        // 5. Check for Street View API
-        setTimeout(() => {
-            if (window.google && window.google.maps) {
-                console.log('Google Maps API available:', Object.keys(window.google.maps));
-            }
-        }, 2000);
-    }
-
-
-    // Test capture function for manual testing
-    function testImageCapture() {
-        console.log('🧪 Testing image capture...');
-        updateStatus('Testing image capture...');
-        
-        const canvas = findStreetViewCanvas();
-        
-        if (!canvas) {
-            showNotification('❌ No Street View canvas found', 'error');
-            updateStatus('Canvas not found');
-            return;
-        }
-        
-        console.log(`📐 Found canvas: ${canvas.width}x${canvas.height}`);
-        const dataURL = captureCanvas(canvas);
-        
-        if (dataURL) {
-            // For testing, save with a test filename
-            saveImage(dataURL, 'TEST', 0);
-            updateStatus('✅ Test capture successful!');
-            
-            // Optional: Show preview
-            if (IMAGE_CAPTURE.debugMode) {
-                showImagePreview(dataURL);
-            }
-        } else {
-            showNotification('❌ Failed to capture canvas', 'error');
-            updateStatus('Capture failed');
-        }
-    }
-
-    // Alternative approach: Use html2canvas library or browser screenshot
-// First, let's try to find if Street View is in an iframe or shadow DOM
-
-function investigateStreetView() {
-    console.log('🔍 Investigating Street View rendering...');
-    
-    // Check for iframes
-    const iframes = document.querySelectorAll('iframe');
-    console.log(`Found ${iframes.length} iframes:`);
-    iframes.forEach((iframe, i) => {
-        console.log(`  iframe ${i}: ${iframe.src || 'no src'}, size: ${iframe.width}x${iframe.height}`);
-    });
-    
-    // Check for shadow roots
-    const allElements = document.querySelectorAll('*');
-    let shadowCount = 0;
-    allElements.forEach(el => {
-        if (el.shadowRoot) {
-            shadowCount++;
-            console.log(`Shadow root found on:`, el.tagName, el.className);
-        }
-    });
-    console.log(`Total shadow roots: ${shadowCount}`);
-    
-    // Look for Google Maps specific elements
-    const mapElements = document.querySelectorAll('[class*="gm-"], [class*="widget-scene"], [class*="panorama"]');
-    console.log(`Found ${mapElements.length} map-related elements`);
-    
-    // Check if there's a WebGL context we're missing
-    const allCanvases = document.querySelectorAll('canvas');
-    allCanvases.forEach((canvas, i) => {
-        const gl = canvas.getContext('webgl') || canvas.getContext('webgl2');
-        if (gl) {
-            const attrs = gl.getContextAttributes();
-            console.log(`Canvas ${i} WebGL attributes:`, attrs);
-        }
-    });
-}
-
-// Completely different approach: Use DOM screenshot
-function captureUsingDOMScreenshot() {
-    console.log('📸 Attempting DOM screenshot...');
-    
-    // Find the game container
-    const gameContainer = document.querySelector('.game_layout__gameCanvas, .game-layout__canvas, [class*="game_page"], .main-content');
-    
-    if (!gameContainer) {
-        console.log('❌ Game container not found');
-        return;
-    }
-    
-    // Method 1: Use getScreenshot if available (some browsers)
-    if (gameContainer.getScreenshot) {
-        gameContainer.getScreenshot().then(blob => {
-            const url = URL.createObjectURL(blob);
-            saveImage(url, 'DOM_SCREENSHOT', 1);
-        });
-    }
-    
-    // Method 2: Create a foreign object SVG (works sometimes)
-    const bounds = gameContainer.getBoundingClientRect();
-    const width = bounds.width;
-    const height = bounds.height;
-    
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    
-    const data = `
-        <svg xmlns='http://www.w3.org/2000/svg' width='${width}' height='${height}'>
-            <foreignObject width='100%' height='100%'>
-                <div xmlns='http://www.w3.org/1999/xhtml'>
-                    ${gameContainer.innerHTML}
-                </div>
-            </foreignObject>
-        </svg>
-    `;
-    
-    const img = new Image();
-    const svg = new Blob([data], {type: 'image/svg+xml;charset=utf-8'});
-    const url = URL.createObjectURL(svg);
-    
-    img.onload = function() {
-        ctx.drawImage(img, 0, 0);
-        URL.revokeObjectURL(url);
-        const dataURL = canvas.toDataURL('image/jpeg', 0.8);
-        if (dataURL) {
-            saveImage(dataURL, 'SVG_CAPTURE', 1);
-        }
-    };
-    img.src = url;
-}
-
-// Nuclear option: Use browser's built-in screenshot capability
-function requestBrowserScreenshot() {
-    console.log('🖼️ Requesting browser screenshot...');
-    
-    // This requires special permissions but Tampermonkey might allow it
-    if (navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) {
-        navigator.mediaDevices.getDisplayMedia({
-            video: {
-                width: 1920,
-                height: 1080
-            }
-        }).then(stream => {
-            const video = document.createElement('video');
-            video.srcObject = stream;
-            video.play();
-            
-            video.onloadedmetadata = () => {
-                const canvas = document.createElement('canvas');
-                canvas.width = video.videoWidth;
-                canvas.height = video.videoHeight;
-                const ctx = canvas.getContext('2d');
-                
-                // Wait a bit for video to be ready
-                setTimeout(() => {
-                    ctx.drawImage(video, 0, 0);
-                    const dataURL = canvas.toDataURL('image/jpeg', 0.8);
-                    
-                    // Stop the stream
-                    stream.getTracks().forEach(track => track.stop());
-                    
-                    if (dataURL) {
-                        saveImage(dataURL, 'SCREEN_CAPTURE', 1);
-                        showImagePreview(dataURL);
-                    }
-                }, 100);
-            };
-        }).catch(err => {
-            console.error('Screen capture denied:', err);
-        });
-    }
-}
-
-// Let's also try intercepting image loads
-function interceptImageLoads() {
-    console.log('🎣 Intercepting image loads...');
-    
-    const originalImage = window.Image;
-    window.Image = function() {
-        const img = new originalImage();
-        const originalSrc = img.__lookupSetter__('src');
-        
-        img.__defineSetter__('src', function(value) {
-            if (value && value.includes('streetview') || value.includes('cbk')) {
-                console.log('🗺️ Street View tile detected:', value.substring(0, 100));
-            }
-            originalSrc.call(this, value);
-        });
-        
-        return img;
-    };
-    
-    // Also check existing images
-    const images = document.querySelectorAll('img');
-    images.forEach(img => {
-        if (img.src && (img.src.includes('streetview') || img.src.includes('cbk'))) {
-            console.log('Found Street View image:', img.src.substring(0, 100));
-        }
-    });
-}
-
-    // Show a preview of captured image (for debugging)
-    function showImagePreview(dataURL) {
-        const preview = document.createElement('div');
-        preview.style.cssText = `
-            position: fixed;
-            bottom: 20px;
-            left: 20px;
-            z-index: 999999;
-            background: white;
-            padding: 10px;
-            border-radius: 8px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-            max-width: 300px;
-        `;
-        
-        const img = document.createElement('img');
-        img.src = dataURL;
-        img.style.cssText = 'width: 100%; border-radius: 4px;';
-        
-        const closeBtn = document.createElement('button');
-        closeBtn.textContent = 'Close Preview';
-        closeBtn.style.cssText = `
-            width: 100%;
-            margin-top: 10px;
-            padding: 5px;
-            background: #f44336;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-        `;
-        closeBtn.onclick = () => preview.remove();
-        
-        preview.appendChild(img);
-        preview.appendChild(closeBtn);
-        document.body.appendChild(preview);
-        
-        // Auto-remove after 5 seconds
-        setTimeout(() => preview.remove(), 5000);
-    }
-
-    // Hook into guess submission
-    function initializeImageCapture() {
-        console.log('📸 Initializing image capture module...');
-        
-        // Monitor for guess button clicks
-        document.addEventListener('click', function(e) {
-            // Look for guess button (multiple possible selectors)
-            const guessButton = e.target.closest(
-                'button[data-qa="guess-button"], ' +
-                'button[class*="guess"], ' +
-                'button[class*="submit"], ' +
-                '.game-statuses__guess-button, ' +
-                '[class*="game-status"] button'
-            );
-            
-            if (guessButton && IMAGE_CAPTURE.enabled && !IMAGE_CAPTURE.capturedThisRound) {
-                console.log('🎯 Guess button clicked! Attempting capture...');
-                
-                // Small delay to ensure the guess is registered
-                setTimeout(() => {
-                    const canvas = findStreetViewCanvas();
-                    if (canvas && currentGameToken) {
-                        const dataURL = captureCanvas(canvas);
-                        if (dataURL) {
-                            // Determine round number (you may need to adjust this logic)
-                            const roundNumber = IMAGE_CAPTURE.currentRoundNumber + 1;
-                            saveImage(dataURL, currentGameToken, roundNumber);
-                            IMAGE_CAPTURE.capturedThisRound = true;
-                            IMAGE_CAPTURE.currentRoundNumber = roundNumber;
-                        }
-                    }
-                }, 100);
-            }
-        }, true); // Use capture phase to catch event early
-        
-        // Reset capture flag when new round starts
-        const observer = new MutationObserver(() => {
-            // Look for round change indicators
-            const roundIndicator = document.querySelector('[class*="round-result"], [class*="round-number"]');
-            if (roundIndicator) {
-                IMAGE_CAPTURE.capturedThisRound = false;
-            }
-        });
-        
-        observer.observe(document.body, { 
-            childList: true, 
-            subtree: true 
-        });
-    }
-
-    // ==================== END IMAGE CAPTURE MODULE ====================
-
-    // Data storage
+    // ==================== DATA STORAGE ====================
     let statsData = GM_getValue(CONFIG.STORAGE_KEY, []);
     let currentGameToken = null;
     let isMonitoring = false;
     let isTracking = true;
 
-    console.log('📊 Stats Tracker: Found', statsData.length, 'saved games');
+    console.log('📊 Found', statsData.length, 'saved games');
 
-    // CSS Styles - inject immediately
-    const styles = `
-        #stats-tracker-panel {
-            position: fixed !important;
-            top: 80px !important;
-            right: 10px !important;
-            background: rgba(20, 20, 20, 0.95) !important;
-            color: white !important;
-            padding: 15px !important;
-            border-radius: 8px !important;
-            z-index: 2147483647 !important;
-            min-width: 250px !important;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
-            border: 2px solid #4CAF50 !important;
-        }
+    // ==================== SHARED UI CONTAINER ====================
+    function getOrCreateToolbar() {
+    let toolbar = document.getElementById('geoguessr-toolbar');
+    if (!toolbar) {
+        toolbar = document.createElement('div');
+        toolbar.id = 'geoguessr-toolbar';
+        toolbar.style.cssText = `
+            position: fixed;
+            top: 80px; /* Positioned right under the GeoGuessr banner */
+            right: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            z-index: 2147483647;
+            align-items: center;
+        `;
+        document.body.appendChild(toolbar);
+    }
+    return toolbar;
+}
+   function addButtonToToolbar(button) {
+    const toolbar = getOrCreateToolbar();
 
-        #stats-tracker-panel * {
-            box-sizing: border-box !important;
-        }
-
-        #stats-tracker-panel h3 {
-            margin: 0 0 10px 0 !important;
-            color: #4CAF50 !important;
-            font-size: 18px !important;
-            font-weight: bold !important;
-        }
-
-        #stats-tracker-panel button {
-            display: block !important;
-            width: 100% !important;
-            margin: 5px 0 !important;
-            padding: 8px 12px !important;
-            background: #4CAF50 !important;
-            color: white !important;
-            border: none !important;
-            border-radius: 4px !important;
-            cursor: pointer !important;
-            font-size: 14px !important;
-            font-weight: 500 !important;
-            transition: all 0.2s !important;
-        }
-
-        #stats-tracker-panel button:hover {
-            background: #45a049 !important;
-            transform: translateY(-1px) !important;
-        }
-
-        #clear-data-btn {
-            background: #f44336 !important;
-        }
-
-        #clear-data-btn:hover {
-            background: #da190b !important;
-        }
-
-        #tracker-status {
-            padding: 8px !important;
-            margin: 8px 0 !important;
-            background: rgba(76, 175, 80, 0.2) !important;
-            border: 1px solid #4CAF50 !important;
-            border-radius: 4px !important;
-            text-align: center !important;
-            font-size: 13px !important;
-            font-weight: 500 !important;
-        }
-
-        #current-game-info {
-            font-size: 12px !important;
-            margin: 10px 0 !important;
-            padding: 8px !important;
-            background: rgba(255, 255, 255, 0.05) !important;
-            border-radius: 4px !important;
-            line-height: 1.5 !important;
-        }
-
-        #stats-summary {
-            margin-top: 10px !important;
-            padding-top: 10px !important;
-            border-top: 1px solid rgba(255, 255, 255, 0.2) !important;
-            font-size: 13px !important;
-        }
-
-        #stats-summary p {
-            margin: 5px 0 !important;
-        }
-
-        #stats-tracker-toggle {
-            position: fixed !important;
-            top: 20px !important;
-            right: 20px !important;
-            width: 50px !important;
-            height: 50px !important;
-            background: linear-gradient(135deg, #4CAF50, #45a049) !important;
-            color: white !important;
-            border-radius: 50% !important;
-            cursor: pointer !important;
-            z-index: 2147483647 !important;
-            font-size: 24px !important;
-            display: flex !important;
-            align-items: center !important;
-            justify-content: center !important;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.4) !important;
-            transition: all 0.3s ease !important;
-            border: 2px solid white !important;
-            user-select: none !important;
-        }
-
-        #stats-tracker-toggle:hover {
-            transform: scale(1.1) rotate(10deg) !important;
-            box-shadow: 0 6px 20px rgba(76, 175, 80, 0.6) !important;
-        }
-
-        #stats-tracker-toggle:active {
-            transform: scale(0.95) !important;
-        }
+    // Smaller button styling
+    button.style.cssText = `
+        width: 40px !important;
+        height: 40px !important;
+        border-radius: 50% !important;
+        cursor: pointer !important;
+        font-size: 18px !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.3) !important;
+        transition: all 0.3s ease !important;
+        border: 1px solid rgba(255, 255, 255, 0.3) !important;
+        user-select: none !important;
+        flex-shrink: 0;
     `;
 
-    // Inject styles
-    GM_addStyle(styles);
-    console.log('✅ Stats Tracker: Styles injected');
+    // Add hover effects
+    button.addEventListener('mouseenter', function() {
+        this.style.transform = 'scale(1.1)';
+        this.style.boxShadow = '0 4px 12px rgba(0, 0, 0, 0.4)';
+    });
 
-    // Create UI with multiple attempts
-    function createUI() {
-        console.log('🔨 Stats Tracker: Creating UI...');
+    button.addEventListener('mouseleave', function() {
+        this.style.transform = 'scale(1)';
+        this.style.boxShadow = '0 2px 8px rgba(0,0,0,0.3)';
+    });
 
-        // Check if UI already exists
-        if (document.getElementById('stats-tracker-toggle')) {
-            console.log('⚠️ Stats Tracker: UI already exists');
-            return;
-        }
-
-        try {
-            // Create toggle button
-            const toggleBtn = document.createElement('div');
-            toggleBtn.id = 'stats-tracker-toggle';
-            toggleBtn.innerHTML = '📊';
-            toggleBtn.title = 'GeoGuessr Stats Tracker (Click to toggle)';
-            document.body.appendChild(toggleBtn);
-            console.log('✅ Toggle button created');
-
-            // Create main panel
-            const panel = document.createElement('div');
-            panel.id = 'stats-tracker-panel';
-            panel.style.display = 'none';
-            panel.innerHTML = `
-                <h3>📊 Stats Tracker</h3>
-                <div id="tracker-status">✅ Ready</div>
-                <div id="current-game-info">No active game</div>
-                <button id="export-csv-btn">📥 Export to CSV</button>
-                <button id="import-recent-btn">📤 Import Recent Games</button>
-                <button id="test-api-btn">🔧 Test API Connection</button>
-                
-                <div style="border-top: 1px solid rgba(255,255,255,0.2); margin: 10px 0; padding-top: 10px;">
-                    <h4 style="margin: 0 0 10px 0; color: #4CAF50; font-size: 14px;">📸 Image Capture</h4>
-                    <div id="screen-capture-status" style="margin-bottom: 10px; font-size: 12px;">
-                        Screen Capture: <strong>INACTIVE</strong>
-                    </div>
-                    <button id="enable-screen-capture-btn">🖥️ Enable Screen Capture</button>
-                    <button id="manual-capture-btn">📸 Capture Now</button>
-                    <button id="toggle-auto-capture-btn">
-                        ${SCREEN_CAPTURE.captureOnGuess ? '⏸️ Disable' : '▶️ Enable'} Auto-Capture
-                    </button>
-                </div>
-                
-                <button id="clear-data-btn">🗑️ Clear Data</button>
-                <button id="toggle-tracking-btn">⏸️ Pause Tracking</button>
-                <div id="stats-summary">
-                    <p><strong>Games tracked:</strong> <span id="total-games">0</span></p>
-                    <p><strong>Total rounds:</strong> <span id="total-rounds">0</span></p>
-                </div>
-            `;
-            document.body.appendChild(panel);
-            console.log('✅ Panel created');
-
-            // Add event listeners
-            toggleBtn.addEventListener('click', togglePanel);
-            document.getElementById('export-csv-btn').addEventListener('click', exportToCSV);
-            document.getElementById('import-recent-btn').addEventListener('click', importRecentGames);
-            document.getElementById('test-api-btn').addEventListener('click', testAPIConnection);
-            document.getElementById('clear-data-btn').addEventListener('click', clearData);
-            document.getElementById('toggle-tracking-btn').addEventListener('click', toggleTracking);
-            document.getElementById('test-capture-btn').addEventListener('click', testImageCapture);
-            document.getElementById('toggle-capture-btn').addEventListener('click', toggleImageCapture);
-            document.getElementById('capture-all-btn').addEventListener('click', captureAllCanvases);
-            document.getElementById('try-all-capture-btn').addEventListener('click', tryAllCaptureMethods);
-            document.getElementById('enable-screen-capture-btn').addEventListener('click', toggleScreenCapture);
-            document.getElementById('manual-capture-btn').addEventListener('click', manualScreenCapture);
-            document.getElementById('toggle-auto-capture-btn').addEventListener('click', () => {
-                SCREEN_CAPTURE.captureOnGuess = !SCREEN_CAPTURE.captureOnGuess;
-                GM_setValue('capture_on_guess', SCREEN_CAPTURE.captureOnGuess);
-                document.getElementById('toggle-auto-capture-btn').innerHTML = 
-                    `${SCREEN_CAPTURE.captureOnGuess ? '⏸️ Disable' : '▶️ Enable'} Auto-Capture`;
-                showNotification(`Auto-capture ${SCREEN_CAPTURE.captureOnGuess ? 'enabled' : 'disabled'}`, 'info');
-                if (SCREEN_CAPTURE.captureOnGuess && SCREEN_CAPTURE.enabled) {
-                    setupAutomaticCapture();
-                }
-            });
-
-            updateSummary();
-            console.log('✅ Stats Tracker: UI created successfully!');
-
-            // Show notification that script is loaded
-            showNotification('Stats Tracker loaded! Click 📊 to open.', 'success');
-
-        } catch (error) {
-            console.error('❌ Stats Tracker: Error creating UI:', error);
-        }
+    // Check if button already exists to avoid duplicates
+    const existingButton = document.getElementById(button.id);
+    if (!existingButton) {
+        toolbar.appendChild(button);
     }
+}
 
-    // Test API connection
-    async function testAPIConnection() {
-        updateStatus('Testing API connection...');
-
-        try {
-            // Try to fetch user profile as a test
-            const response = await new Promise((resolve, reject) => {
-                GM_xmlhttpRequest({
-                    method: 'GET',
-                    url: 'https://www.geoguessr.com/api/v3/profiles/user',
-                    headers: {
-                        'Accept': 'application/json',
-                    },
-                    onload: resolve,
-                    onerror: reject
-                });
-            });
-
-            if (response.status === 200) {
-                const data = JSON.parse(response.responseText);
-                showNotification(`✅ API working! Logged in as: ${data.nick || 'User'}`, 'success');
-                updateStatus('API connection successful!');
-            } else if (response.status === 401) {
-                showNotification('⚠️ Not logged in to GeoGuessr', 'warning');
-                updateStatus('Please log in to GeoGuessr');
-            } else {
-                showNotification(`❌ API error: ${response.status}`, 'error');
-                updateStatus(`API error: ${response.status}`);
-            }
-        } catch (error) {
-            console.error('API test error:', error);
-            showNotification('❌ Failed to connect to API', 'error');
-            updateStatus('API connection failed');
-        }
-    }
-
-    // Show notification
-    function showNotification(message, type = 'info') {
-        const colors = {
-            success: '#4CAF50',
-            error: '#f44336',
-            warning: '#ff9800',
-            info: '#2196F3'
-        };
-
-        const notification = document.createElement('div');
-        notification.style.cssText = `
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            background: ${colors[type]};
-            color: white;
-            padding: 15px 20px;
-            border-radius: 8px;
-            z-index: 2147483648;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-            font-family: Arial, sans-serif;
-            font-size: 14px;
-            animation: slideIn 0.3s ease;
-            max-width: 300px;
-        `;
-        notification.textContent = message;
-
-        document.body.appendChild(notification);
-
-        setTimeout(() => {
-            notification.style.animation = 'slideOut 0.3s ease';
-            setTimeout(() => notification.remove(), 300);
-        }, 3000);
-    }
-
-    // Add animation styles
-    GM_addStyle(`
-        @keyframes slideIn {
-            from { transform: translateX(400px); opacity: 0; }
-            to { transform: translateX(0); opacity: 1; }
-        }
-        @keyframes slideOut {
-            from { transform: translateX(0); opacity: 1; }
-            to { transform: translateX(400px); opacity: 0; }
-        }
-    `);
-
-    // Toggle panel visibility
-    function togglePanel() {
-        const panel = document.getElementById('stats-tracker-panel');
-        if (panel) {
-            const isVisible = panel.style.display !== 'none';
-            panel.style.display = isVisible ? 'none' : 'block';
-            console.log('Panel toggled:', !isVisible ? 'visible' : 'hidden');
-        }
-    }
-
-    // Monitor for URL changes
     function startUrlMonitoring() {
-        console.log('👀 Stats Tracker: Starting URL monitoring...');
-        let currentUrl = window.location.href;
+    let currentUrl = window.location.href;
 
-        // Check URL periodically
-        setInterval(() => {
-            if (window.location.href !== currentUrl) {
-                currentUrl = window.location.href;
-                console.log('📍 URL changed to:', currentUrl);
-                handleUrlChange(currentUrl);
-            }
-        }, 1000);
+    setInterval(() => {
+        if (window.location.href !== currentUrl) {
+            currentUrl = window.location.href;
+            handleUrlChange(currentUrl);
+        }
+    }, 1000);
 
-        // Check initial URL
-        handleUrlChange(currentUrl);
-    }
+    handleUrlChange(currentUrl); // Check current URL on init
+}
 
-    // Handle URL changes
     function handleUrlChange(url) {
         const patterns = [
             /\/game\/([a-zA-Z0-9_-]+)/,
@@ -1122,9 +120,8 @@ function interceptImageLoads() {
                 if (token !== currentGameToken) {
                     currentGameToken = token;
                     console.log('🎮 Game detected:', currentGameToken);
-                    updateStatus('Game detected: ' + currentGameToken.substring(0, 8) + '...');
+                    updateStatus('Game: ' + currentGameToken.substring(0, 8) + '...');
 
-                    // Start monitoring this game
                     if (!isMonitoring) {
                         startGameMonitoring();
                     }
@@ -1134,12 +131,11 @@ function interceptImageLoads() {
         }
     }
 
-    // Monitor current game
     function startGameMonitoring() {
         if (isMonitoring || !currentGameToken) return;
 
         isMonitoring = true;
-        console.log('🔄 Starting game monitoring for:', currentGameToken);
+        console.log('🔄 Monitoring game:', currentGameToken);
 
         const monitorInterval = setInterval(async () => {
             if (!currentGameToken || !isTracking) {
@@ -1150,95 +146,72 @@ function interceptImageLoads() {
 
             try {
                 const gameData = await fetchGameData(currentGameToken);
-                if (gameData) {
-                    if (gameData.state === 'finished') {
-                        console.log('✅ Game finished, saving...');
-                        saveGame(gameData);
-                        currentGameToken = null;
-                        clearInterval(monitorInterval);
-                        isMonitoring = false;
-                    } else {
-                        console.log('⏳ Game still in progress...');
-                    }
+                if (gameData && gameData.state === 'finished') {
+                    console.log('✅ Game finished, saving...');
+                    saveGame(gameData);
+                    currentGameToken = null;
+                    clearInterval(monitorInterval);
+                    isMonitoring = false;
                 }
             } catch (error) {
-                console.error('❌ Error monitoring game:', error);
+                console.error('❌ Monitoring error:', error);
             }
         }, CONFIG.CHECK_INTERVAL);
     }
 
-    // Fetch game data
     async function fetchGameData(token) {
-        console.log('🔍 Fetching game data for:', token);
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'GET',
                 url: `https://www.geoguessr.com/api/v3/games/${token}`,
-                headers: {
-                    'Accept': 'application/json',
-                },
+                headers: { 'Accept': 'application/json' },
                 onload: function(response) {
                     if (response.status >= 200 && response.status < 300) {
                         try {
                             const data = JSON.parse(response.responseText);
-                            console.log('✅ Game data received');
                             resolve(data);
                         } catch (error) {
-                            console.error('❌ Error parsing game data:', error);
                             resolve(null);
                         }
                     } else {
-                        console.warn(`⚠️ Could not fetch game ${token}: ${response.status}`);
                         resolve(null);
                     }
                 },
-                onerror: function(error) {
-                    console.error('❌ Request error:', error);
-                    reject(error);
-                }
+                onerror: reject
             });
         });
     }
 
-    // Save game data
     function saveGame(gameData) {
-        if (!gameData || !gameData.token) {
-            console.log('⚠️ Invalid game data');
+        if (!gameData || !gameData.token) return;
+
+        if (statsData.find(g => g.token === gameData.token)) {
+            console.log('Game already saved');
             return;
         }
 
-        // Check if already saved
-        const existingGame = statsData.find(g => g.token === gameData.token);
-        if (existingGame) {
-            console.log('ℹ️ Game already saved');
-            return;
-        }
-
-        // Format game data
         const formattedGame = formatGameData(gameData);
-
-        // Add to stats
         statsData.push(formattedGame);
         GM_setValue(CONFIG.STORAGE_KEY, statsData);
 
-        updateStatus(`✅ Game saved! Score: ${formattedGame.totalScore}`);
+        updateStatus(`✅ Saved! Score: ${formattedGame.totalScore}`);
         updateSummary();
         updateGameInfo(formattedGame);
         showNotification(`Game saved! Score: ${formattedGame.totalScore}`, 'success');
 
-        console.log('💾 Game saved:', formattedGame);
+        // Broadcast event for other scripts (like screen capture)
+        window.dispatchEvent(new CustomEvent('geoguessr-game-saved', {
+            detail: { game: formattedGame }
+        }));
     }
 
-    // Format game data for storage
     function formatGameData(gameData) {
         const player = gameData.player || {};
         const rounds = [];
 
-        // Process each round
         if (gameData.rounds && player.guesses) {
             gameData.rounds.forEach((round, index) => {
                 const guess = player.guesses[index] || {};
-
                 rounds.push({
                     roundNumber: index + 1,
                     actual: {
@@ -1277,163 +250,96 @@ function interceptImageLoads() {
         };
     }
 
-    // Determine game mode
     function getGameMode(gameData) {
         const { forbidMoving, forbidZooming, forbidRotating } = gameData;
-
-        if (forbidMoving && forbidZooming && forbidRotating) {
-            return 'NMPZ';
-        } else if (forbidMoving && !forbidZooming && !forbidRotating) {
-            return 'No Move';
-        } else if (!forbidMoving && !forbidZooming && !forbidRotating) {
-            return 'Moving';
-        } else {
-            return 'Custom';
-        }
+        if (forbidMoving && forbidZooming && forbidRotating) return 'NMPZ';
+        if (forbidMoving && !forbidZooming && !forbidRotating) return 'No Move';
+        if (!forbidMoving && !forbidZooming && !forbidRotating) return 'Moving';
+        return 'Custom';
     }
 
-    // Import recent games
+    // ==================== IMPORT/EXPORT FUNCTIONS ====================
     async function importRecentGames() {
-        updateStatus('Starting import...');
-        console.log('📤 Starting import of recent games...');
-
         const pagesToScan = prompt('How many pages to scan? (1 page = ~10 games)', '5');
         if (!pagesToScan) return;
 
         const numPages = parseInt(pagesToScan) || 5;
         let imported = 0;
-        let checked = 0;
 
+        updateStatus('Importing...');
         showNotification(`Scanning ${numPages} pages...`, 'info');
 
         try {
             for (let page = 0; page < numPages; page++) {
-                updateStatus(`Scanning page ${page + 1}/${numPages}...`);
+                updateStatus(`Page ${page + 1}/${numPages}...`);
 
-                // Try to fetch from activity feed
-                const activities = await fetchActivities(page);
+                const response = await new Promise((resolve) => {
+                    GM_xmlhttpRequest({
+                        method: 'GET',
+                        url: `https://www.geoguessr.com/api/v3/user/activities?page=${page}&count=10`,
+                        headers: { 'Accept': 'application/json' },
+                        onload: resolve,
+                        onerror: () => resolve({ status: 0 })
+                    });
+                });
 
-                if (activities && activities.length > 0) {
+                if (response.status === 200) {
+                    const activities = JSON.parse(response.responseText);
                     for (const activity of activities) {
                         if (activity.game) {
-                            checked++;
                             const gameData = await fetchGameData(activity.game);
                             if (gameData && gameData.state === 'finished') {
-                                const existingGame = statsData.find(g => g.token === activity.game);
-                                if (!existingGame) {
+                                if (!statsData.find(g => g.token === activity.game)) {
                                     saveGame(gameData);
                                     imported++;
                                 }
                             }
-                            await delay(200);
+                            await new Promise(r => setTimeout(r, 200));
                         }
                     }
                 }
-
-                await delay(500);
+                await new Promise(r => setTimeout(r, 500));
             }
 
-            updateStatus(`✅ Import complete! ${imported} new games`);
+            updateStatus(`✅ Imported ${imported} games`);
             showNotification(`Imported ${imported} new games!`, 'success');
-
         } catch (error) {
-            console.error('❌ Import error:', error);
-            updateStatus('Import failed');
+            console.error('Import error:', error);
             showNotification('Import failed', 'error');
         }
     }
 
-    // Fetch activities
-    async function fetchActivities(page) {
-        return new Promise((resolve) => {
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url: `https://www.geoguessr.com/api/v3/user/activities?page=${page}&count=10`,
-                headers: {
-                    'Accept': 'application/json',
-                },
-                onload: function(response) {
-                    if (response.status === 200) {
-                        try {
-                            const data = JSON.parse(response.responseText);
-                            resolve(data);
-                        } catch (e) {
-                            resolve([]);
-                        }
-                    } else {
-                        resolve([]);
-                    }
-                },
-                onerror: () => resolve([])
-            });
-        });
-    }
-
-    // Export to CSV
     function exportToCSV() {
         if (statsData.length === 0) {
-            alert('No data to export! Play some games first.');
+            alert('No data to export!');
             return;
         }
 
-        // CSV Headers
         const headers = [
-            'Timestamp',
-            'Game Mode',
-            'Map',
-            'Total Score',
-            'Total Distance (m)',
-            'Total Time (s)',
-            'Round',
-            'Actual Country',
-            'Actual Lat',
-            'Actual Lng',
-            'Guessed Country',
-            'Guessed Lat',
-            'Guessed Lng',
-            'Distance (m)',
-            'Score',
-            'Time (s)',
-            'Timed Out',
-            'Time Limit',
-            'No Move',
-            'No Zoom',
-            'No Pan'
+            'Timestamp', 'Game Mode', 'Map', 'Total Score', 'Total Distance (m)', 'Total Time (s)',
+            'Round', 'Actual Country', 'Actual Lat', 'Actual Lng',
+            'Guessed Country', 'Guessed Lat', 'Guessed Lng',
+            'Distance (m)', 'Score', 'Time (s)', 'Timed Out',
+            'Time Limit', 'No Move', 'No Zoom', 'No Pan'
         ];
 
-        // Create CSV content
         let csvContent = headers.join(',') + '\n';
 
         statsData.forEach(game => {
             game.rounds.forEach(round => {
                 const row = [
-                    game.timestamp,
-                    game.gameMode,
-                    `"${game.map}"`,
-                    game.totalScore,
-                    game.totalDistance,
-                    game.totalTime,
-                    round.roundNumber,
-                    round.actual.country,
-                    round.actual.lat,
-                    round.actual.lng,
-                    round.guessed.country,
-                    round.guessed.lat,
-                    round.guessed.lng,
-                    round.distance,
-                    round.score,
-                    round.time,
-                    round.timedOut,
-                    game.restrictions.timeLimit,
-                    game.restrictions.forbidMoving,
-                    game.restrictions.forbidZooming,
-                    game.restrictions.forbidRotating
+                    game.timestamp, game.gameMode, `"${game.map}"`,
+                    game.totalScore, game.totalDistance, game.totalTime,
+                    round.roundNumber, round.actual.country, round.actual.lat, round.actual.lng,
+                    round.guessed.country, round.guessed.lat, round.guessed.lng,
+                    round.distance, round.score, round.time, round.timedOut,
+                    game.restrictions.timeLimit, game.restrictions.forbidMoving,
+                    game.restrictions.forbidZooming, game.restrictions.forbidRotating
                 ];
                 csvContent += row.join(',') + '\n';
             });
         });
 
-        // Download CSV
         const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
@@ -1444,44 +350,118 @@ function interceptImageLoads() {
         document.body.removeChild(a);
         window.URL.revokeObjectURL(url);
 
-        showNotification(`Exported ${statsData.length} games to CSV`, 'success');
+        showNotification(`Exported ${statsData.length} games`, 'success');
     }
 
-    // Clear all data
-    function clearData() {
-        if (confirm('Are you sure you want to clear all tracked data? This cannot be undone.')) {
-            statsData = [];
-            GM_setValue(CONFIG.STORAGE_KEY, statsData);
-            updateSummary();
-            updateStatus('Data cleared');
-            showNotification('All data cleared', 'warning');
-        }
+    // ==================== UI FUNCTIONS ====================
+    function createUI() {
+        if (document.getElementById('stats-tracker-toggle')) return;
+
+        // Create toggle button for toolbar
+        const toggleBtn = document.createElement('div');
+        toggleBtn.id = 'stats-tracker-toggle';
+        toggleBtn.className = 'geoguessr-toolbar-btn';
+        toggleBtn.innerHTML = '📊';
+        toggleBtn.title = 'GeoGuessr Stats Tracker';
+
+        // Add button to shared toolbar
+        addButtonToToolbar(toggleBtn);
+
+        // Create main panel
+        const panel = document.createElement('div');
+        panel.id = 'stats-tracker-panel';
+        panel.style.display = 'none';
+        panel.innerHTML = `
+            <h3>📊 Stats Tracker</h3>
+            <div id="tracker-status">✅ Ready</div>
+            <div id="current-game-info">No active game</div>
+
+            <button id="export-csv-btn">📥 Export to CSV</button>
+            <button id="import-recent-btn">📤 Import Recent Games</button>
+            <button id="test-api-btn">🔧 Test API Connection</button>
+
+            <button id="clear-data-btn">🗑️ Clear Data</button>
+            <button id="toggle-tracking-btn">⏸️ Pause Tracking</button>
+
+            <div id="stats-summary">
+                <p><strong>Games tracked:</strong> <span id="total-games">0</span></p>
+                <p><strong>Total rounds:</strong> <span id="total-rounds">0</span></p>
+            </div>
+        `;
+        document.body.appendChild(panel);
+
+        // Add event listeners
+        toggleBtn.addEventListener('click', () => {
+            const isVisible = panel.style.display !== 'none';
+            panel.style.display = isVisible ? 'none' : 'block';
+
+            // Close other panels when opening this one
+            if (!isVisible) {
+                const capturePanel = document.getElementById('capture-panel');
+                if (capturePanel) capturePanel.style.display = 'none';
+            }
+        });
+
+        document.getElementById('export-csv-btn')?.addEventListener('click', exportToCSV);
+        document.getElementById('import-recent-btn')?.addEventListener('click', importRecentGames);
+        document.getElementById('test-api-btn')?.addEventListener('click', testAPIConnection);
+        document.getElementById('clear-data-btn')?.addEventListener('click', clearData);
+        document.getElementById('toggle-tracking-btn')?.addEventListener('click', toggleTracking);
+
+        updateSummary();
+        showNotification('Stats Tracker loaded!', 'success');
     }
 
-    // Toggle tracking
     function toggleTracking() {
         isTracking = !isTracking;
         const btn = document.getElementById('toggle-tracking-btn');
         if (btn) {
             btn.textContent = isTracking ? '⏸️ Pause Tracking' : '▶️ Resume Tracking';
         }
-        updateStatus(isTracking ? 'Tracking resumed' : 'Tracking paused');
         showNotification(isTracking ? 'Tracking resumed' : 'Tracking paused', 'info');
     }
 
-    // Update status message
-    function updateStatus(message) {
-        const statusEl = document.getElementById('tracker-status');
-        if (statusEl) {
-            statusEl.textContent = message;
+    function clearData() {
+        if (confirm('Clear all tracked data? This cannot be undone.')) {
+            statsData = [];
+            GM_setValue(CONFIG.STORAGE_KEY, statsData);
+            updateSummary();
+            showNotification('All data cleared', 'warning');
         }
-        console.log('📝 Status:', message);
     }
 
-    // Update summary statistics
+    async function testAPIConnection() {
+        updateStatus('Testing API...');
+        try {
+            const response = await new Promise((resolve) => {
+                GM_xmlhttpRequest({
+                    method: 'GET',
+                    url: 'https://www.geoguessr.com/api/v3/profiles/user',
+                    headers: { 'Accept': 'application/json' },
+                    onload: resolve,
+                    onerror: () => resolve({ status: 0 })
+                });
+            });
+
+            if (response.status === 200) {
+                const data = JSON.parse(response.responseText);
+                showNotification(`✅ API working! User: ${data.nick || 'Unknown'}`, 'success');
+            } else {
+                showNotification('API connection failed', 'error');
+            }
+        } catch (error) {
+            showNotification('API test failed', 'error');
+        }
+    }
+
+    function updateStatus(message) {
+        const statusEl = document.getElementById('tracker-status');
+        if (statusEl) statusEl.textContent = message;
+    }
+
     function updateSummary() {
         const totalGames = statsData.length;
-        const totalRounds = statsData.reduce((sum, game) => sum + (game.rounds ? game.rounds.length : 0), 0);
+        const totalRounds = statsData.reduce((sum, game) => sum + (game.rounds?.length || 0), 0);
 
         const totalGamesEl = document.getElementById('total-games');
         const totalRoundsEl = document.getElementById('total-rounds');
@@ -1490,7 +470,6 @@ function interceptImageLoads() {
         if (totalRoundsEl) totalRoundsEl.textContent = totalRounds;
     }
 
-    // Update current game info
     function updateGameInfo(game) {
         const infoEl = document.getElementById('current-game-info');
         if (infoEl && game) {
@@ -1503,98 +482,259 @@ function interceptImageLoads() {
         }
     }
 
-    function toggleImageCapture() {
-        IMAGE_CAPTURE.enabled = !IMAGE_CAPTURE.enabled;
-        GM_setValue('capture_images', IMAGE_CAPTURE.enabled);
-        
-        const btn = document.getElementById('toggle-capture-btn');
-        const status = document.getElementById('capture-status');
-        
-        if (btn) {
-            btn.innerHTML = `${IMAGE_CAPTURE.enabled ? '🔴' : '⚫'} ${IMAGE_CAPTURE.enabled ? 'Disable' : 'Enable'} Auto Capture`;
-        }
-        if (status) {
-            status.textContent = `Image Capture: ${IMAGE_CAPTURE.enabled ? 'ON' : 'OFF'}`;
-        }
-        
-        showNotification(`Image capture ${IMAGE_CAPTURE.enabled ? 'enabled' : 'disabled'}`, 'info');
-        
-        if (IMAGE_CAPTURE.enabled) {
-            initializeImageCapture();
-        }
+    function showNotification(message, type = 'info') {
+        const colors = {
+            success: '#4CAF50',
+            error: '#f44336',
+            warning: '#ff9800',
+            info: '#2196F3'
+        };
+
+        const notification = document.createElement('div');
+        notification.style.cssText = `
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: ${colors[type]};
+            color: white;
+            padding: 15px 20px;
+            border-radius: 8px;
+            z-index: 2147483648;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            font-size: 14px;
+            animation: slideIn 0.3s ease;
+            max-width: 300px;
+        `;
+        notification.textContent = message;
+        document.body.appendChild(notification);
+
+        setTimeout(() => {
+            notification.style.animation = 'slideOut 0.3s ease';
+            setTimeout(() => notification.remove(), 300);
+        }, 3000);
     }
 
-    // Utility function for delays
-    function delay(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+    // ==================== STYLES ====================
+    GM_addStyle(`
+     #geoguessr-toolbar {
+    position: fixed !important;
+    top: 90px !important; /* Right under the GeoGuessr banner */
+    right: 15px !important;
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 8px !important;
+    z-index: 2147483647 !important;
+    align-items: center !important;
+    background: rgba(0, 0, 0, 0.7) !important;
+    padding: 10px 8px !important;
+    border-radius: 20px !important;
+    backdrop-filter: blur(10px) !important;
+    border: 1px solid rgba(255, 255, 255, 0.2) !important;
+    transition: all 0.3s ease !important;
+}
+
+.geoguessr-toolbar-btn {
+    width: 40px !important;
+    height: 40px !important;
+    border-radius: 50% !important;
+    cursor: pointer !important;
+    font-size: 18px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3) !important;
+    transition: all 0.3s ease !important;
+    border: 1px solid rgba(255, 255, 255, 0.3) !important;
+    user-select: none !important;
+    flex-shrink: 0 !important;
+}
+
+#capture-toggle {
+    background: linear-gradient(135deg, #2196F3, #1976D2) !important;
+    color: white !important;
+}
+
+#stats-tracker-toggle {
+    background: linear-gradient(135deg, #4CAF50, #45a049) !important;
+    color: white !important;
+}
+
+.geoguessr-toolbar-btn:hover {
+    transform: scale(1.1) !important;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4) !important;
+}
+
+#capture-toggle:hover {
+    box-shadow: 0 4px 12px rgba(33, 150, 243, 0.4) !important;
+}
+
+#stats-tracker-toggle:hover {
+    box-shadow: 0 4px 12px rgba(76, 175, 80, 0.4) !important;
+}
+
+/* Update panel positioning to be below the toolbar */
+#capture-panel, #stats-tracker-panel {
+    position: fixed !important;
+    top: 140px !important; /* Below the toolbar */
+    right: 90px !important;
+    background: rgba(20, 20, 20, 0.95) !important;
+    color: white !important;
+    padding: 12px !important;
+    border-radius: 8px !important;
+    z-index: 2147483646 !important;
+    min-width: 220px !important;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
+    border: 2px solid #2196F3 !important;
+    backdrop-filter: blur(10px) !important;
+}
+
+#stats-tracker-panel {
+    border-color: #4CAF50 !important;
+}
+
+#capture-panel *,
+#stats-tracker-panel * {
+    box-sizing: border-box !important;
+}
+
+#capture-panel h3,
+#stats-tracker-panel h3 {
+    margin: 0 0 8px 0 !important;
+    color: #2196F3 !important;
+    font-size: 16px !important;
+    font-weight: bold !important;
+}
+
+#stats-tracker-panel h3 {
+    color: #4CAF50 !important;
+}
+
+#capture-panel button,
+#stats-tracker-panel button {
+    display: block !important;
+    width: 100% !important;
+    margin: 4px 0 !important;
+    padding: 6px 10px !important;
+    background: #2196F3 !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 4px !important;
+    cursor: pointer !important;
+    font-size: 13px !important;
+    font-weight: 500 !important;
+    transition: all 0.2s !important;
+}
+
+#stats-tracker-panel button {
+    background: #4CAF50 !important;
+}
+
+#capture-panel button:hover,
+#stats-tracker-panel button:hover {
+    transform: translateY(-1px) !important;
+}
+
+#capture-panel button:hover {
+    background: #1976D2 !important;
+}
+
+#stats-tracker-panel button:hover {
+    background: #45a049 !important;
+}
+
+#stop-capture-btn,
+#clear-data-btn {
+    background: #f44336 !important;
+}
+
+#stop-capture-btn:hover,
+#clear-data-btn:hover {
+    background: #da190b !important;
+}
+
+/* Smaller status elements */
+#capture-status,
+#tracker-status {
+    padding: 6px !important;
+    margin: 6px 0 !important;
+    background: rgba(255, 255, 255, 0.1) !important;
+    border: 1px solid rgba(255, 255, 255, 0.2) !important;
+    border-radius: 4px !important;
+    text-align: center !important;
+    font-size: 12px !important;
+    font-weight: 500 !important;
+}
+
+#capture-info,
+#current-game-info,
+#stats-summary {
+    font-size: 11px !important;
+    margin: 8px 0 !important;
+    padding: 6px !important;
+    background: rgba(255, 255, 255, 0.05) !important;
+    border-radius: 4px !important;
+    line-height: 1.4 !important;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    #geoguessr-toolbar {
+        top: 70px !important;
+        right: 10px !important;
+        gap: 6px !important;
+        padding: 8px 6px !important;
     }
 
-    // Initialize with multiple attempts
-    async function init() {
-        console.log('🚀 Stats Tracker: Initializing...');
+    .geoguessr-toolbar-btn {
+        width: 35px !important;
+        height: 35px !important;
+        font-size: 16px !important;
+    }
 
-        // Try to create UI immediately
+    #capture-panel,
+    #stats-tracker-panel {
+        top: 120px !important;
+        right: 10px !important;
+        min-width: 200px !important;
+        padding: 10px !important;
+    }
+}
+
+@media (max-width: 480px) {
+    #geoguessr-toolbar {
+        top: 60px !important;
+        flex-direction: row !important; /* Horizontal on very small screens */
+        gap: 8px !important;
+        padding: 8px 10px !important;
+        border-radius: 15px !important;
+    }
+
+    #capture-panel,
+    #stats-tracker-panel {
+        top: 110px !important;
+        right: 10px !important;
+        min-width: 180px !important;
+    }
+}
+    `);
+
+    // ==================== INITIALIZATION ====================
+    function init() {
+        console.log('🚀 Initializing Stats Tracker...');
         createUI();
-
-        // Check of image capture is enabled
-        if (IMAGE_CAPTURE.enabled) {
-            initializeImageCapture();
-        }
-
-        // Start monitoring
         startUrlMonitoring();
-
-        // Retry UI creation if it failed
-        let retries = 0;
-        const maxRetries = 5;
-
-        const retryInterval = setInterval(() => {
-            if (document.getElementById('stats-tracker-toggle')) {
-                clearInterval(retryInterval);
-                console.log('✅ UI verified, initialization complete!');
-            } else if (retries < maxRetries) {
-                retries++;
-                console.log(`🔄 Retry ${retries}/${maxRetries} creating UI...`);
-                createUI();
-            } else {
-                clearInterval(retryInterval);
-                console.error('❌ Failed to create UI after', maxRetries, 'attempts');
-            }
-        }, 2000);
-
         updateStatus('Ready to track');
+
+        // Expose current game token for screen capture script
+        window.geoguessrCurrentGame = () => currentGameToken;
     }
 
-    // Multiple initialization strategies
-    console.log('🎯 Starting initialization strategies...');
-
-    // Strategy 1: Immediate execution
-    init();
-
-    // Strategy 2: Wait for DOM
+    // Start the script
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => {
-            console.log('📄 DOM loaded, checking UI...');
-            if (!document.getElementById('stats-tracker-toggle')) {
-                init();
-            }
-        });
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
     }
-
-    // Strategy 3: Wait for window load
-    window.addEventListener('load', () => {
-        console.log('🪟 Window loaded, checking UI...');
-        if (!document.getElementById('stats-tracker-toggle')) {
-            init();
-        }
-    });
-
-    // Strategy 4: Delayed fallback
-    setTimeout(() => {
-        if (!document.getElementById('stats-tracker-toggle')) {
-            console.log('⏱️ Delayed initialization...');
-            init();
-        }
-    }, 3000);
 
 })();

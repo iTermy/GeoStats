@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         GeoGuessr Stats Tracker (Enhanced Geocoding)
+// @name         GeoGuessr Stats Tracker
 // @namespace    http://tampermonkey.net/
-// @version      3.3
-// @description  Track your GeoGuessr game performance with high-precision country detection
-// @author       You
+// @version      3.4
+// @description  Tracks GeoGuessr game performance
+// @author       Ben Foronda
 // @match        https://www.geoguessr.com/*
 // @match        https://geoguessr.com/*
 // @grant        GM_addStyle
@@ -12,334 +12,144 @@
 // @grant        GM_xmlhttpRequest
 // @connect      www.geoguessr.com
 // @connect      geoguessr.com
-// @connect      cdn.jsdelivr.net
 // @connect      raw.githubusercontent.com
-// @connect      nominatim.openstreetmap.org
-// @connect      api.bigdatacloud.net
+// @connect      cdn.jsdelivr.net
 // @run-at       document-idle
 // ==/UserScript==
 
 (function() {
     'use strict';
 
-    console.log('%c📊 GeoGuessr Stats Tracker v3.3 Loaded!', 'color: #4CAF50; font-weight: bold; font-size: 14px');
+    const POLL_MS = 5000;
+    const STORAGE_KEY = 'geoguessr_stats_data';
+    
+    let games = GM_getValue(STORAGE_KEY, []);
+    let activeToken = null;
+    let monitoring = false;
+    let tracking = true;
+    let lastGame = null;
+    let countryData = null;
+    let turfReady = false;
 
-    // ==================== ENHANCED GEOCODING SYSTEM ====================
-    const CountryGeocoder = {
-        polygons: null,
-        loading: false,
-        loaded: false,
-        turfLoaded: false,
-        useAPI: true,
-
-        async init() {
-            if (this.loaded || this.loading) return;
-            this.loading = true;
-
-            try {
-                await this.loadTurf();
-
-                const dataSources = [
-                    {
-                        name: 'Natural Earth 10m',
-                        url: 'https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_admin_0_countries.geojson',
-                        resolution: '10m (~1-5km precision)'
-                    },
-                    {
-                        name: 'World Boundaries',
-                        url: 'https://raw.githubusercontent.com/datasets/geo-countries/master/data/countries.geojson',
-                        resolution: '50m (~5-10km precision)'
-                    },
-                    {
-                        name: 'Simplified Boundaries',
-                        url: 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json',
-                        resolution: '110m (~10-20km precision)',
-                        isTopoJSON: true
-                    }
-                ];
-
-                let dataLoaded = false;
-                for (const source of dataSources) {
-                    try {
-                        const response = await fetch(source.url);
-                        if (response.ok) {
-                            const data = await response.json();
-                            if (source.isTopoJSON) {
-                                await this.loadTopoJSON();
-                                this.polygons = await this.processTopoJSON(data);
-                            } else {
-                                this.polygons = this.processGeoJSON(data);
-                            }
-                            dataLoaded = true;
-                            break;
-                        }
-                    } catch (error) {
-                        continue;
-                    }
-                }
-
-                if (!dataLoaded) {
-                    this.polygons = this.getOfflinePreciseData();
-                }
-
-                this.loaded = true;
-            } catch (error) {
-                this.polygons = this.getOfflinePreciseData();
-                this.loaded = true;
-            }
-
-            this.loading = false;
-        },
-
-        async loadTurf() {
-            if (this.turfLoaded) return;
-
-            return new Promise((resolve) => {
-                const script = document.createElement('script');
-                script.src = 'https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js';
-                script.onload = () => {
-                    this.turfLoaded = true;
-                    resolve();
-                };
-                script.onerror = resolve;
-                document.head.appendChild(script);
-            });
-        },
-
-        async loadTopoJSON() {
-            return new Promise((resolve) => {
-                if (window.topojson) {
-                    resolve();
-                    return;
-                }
-
-                const script = document.createElement('script');
-                script.src = 'https://cdn.jsdelivr.net/npm/topojson-client@3';
-                script.onload = resolve;
-                script.onerror = resolve;
-                document.head.appendChild(script);
-            });
-        },
-
-        processGeoJSON(geoData) {
-            const countries = {};
-            if (!geoData.features) return countries;
-
-            geoData.features.forEach(feature => {
-                if (!feature.properties || !feature.geometry) return;
-
-                const iso2 = feature.properties.ISO_A2 ||
-                            feature.properties.iso_a2 ||
-                            feature.properties.ISO2 ||
-                            feature.properties.iso_3166_1_alpha_2 ||
-                            feature.properties.ISO_A2_EH;
-
-                if (!iso2 || iso2 === '-99' || iso2.length !== 2) return;
-
-                countries[iso2.toUpperCase()] = {
-                    geometry: feature.geometry,
-                    properties: feature.properties
-                };
-            });
-
-            return countries;
-        },
-
-        async processTopoJSON(topology) {
-            if (!window.topojson) return {};
-            try {
-                const geojson = window.topojson.feature(topology, topology.objects.countries);
-                return this.processGeoJSON(geojson);
-            } catch (error) {
-                return {};
-            }
-        },
-
-        async getCountry(lat, lng) {
-            if (lat === null || lng === null || lat === undefined || lng === undefined) {
-                return 'Unknown';
-            }
-
-            lng = ((lng + 180) % 360 + 360) % 360 - 180;
-
-            const polygonCountry = this.getCountryFromPolygons(lat, lng);
-            if (polygonCountry !== 'Unknown') {
-                return polygonCountry;
-            }
-
-            if (this.useAPI) {
-                try {
-                    const apiCountry = await this.getCountryFromAPI(lat, lng);
-                    if (apiCountry !== 'Unknown') {
-                        return apiCountry;
-                    }
-                } catch (error) {
-                    console.warn('API geocoding failed:', error);
-                }
-            }
-
-            return 'Unknown';
-        },
-
-        getCountryFromPolygons(lat, lng) {
-            if (!this.loaded || !this.polygons) return 'Unknown';
-            const point = [lng, lat];
-
-            if (this.turfLoaded && window.turf) {
-                return this.getCountryWithTurf(point);
-            }
-
-            return this.getCountryManual(point);
-        },
-
-        getCountryWithTurf(point) {
-            const turfPoint = window.turf.point(point);
-
-            for (const [countryCode, data] of Object.entries(this.polygons)) {
-                try {
-                    if (window.turf.booleanPointInPolygon(turfPoint, data.geometry)) {
-                        return countryCode;
-                    }
-                } catch (e) {
-                    continue;
-                }
-            }
-
-            return this.findNearestCountry(point);
-        },
-
-        findNearestCountry(point) {
-            if (!this.turfLoaded || !window.turf) return 'Unknown';
-
-            const turfPoint = window.turf.point(point);
-            let nearestCountry = 'Unknown';
-            let minDistance = Infinity;
-
-            for (const [countryCode, data] of Object.entries(this.polygons)) {
-                try {
-                    const distance = window.turf.pointToLineDistance(turfPoint, data.geometry, {units: 'kilometers'});
-                    if (distance < minDistance && distance < 10) {
-                        minDistance = distance;
-                        nearestCountry = countryCode;
-                    }
-                } catch (e) {
-                    continue;
-                }
-            }
-
-            return nearestCountry;
-        },
-
-        getCountryManual(point) {
-            for (const [countryCode, data] of Object.entries(this.polygons)) {
-                try {
-                    const geometry = data.geometry;
-                    if (geometry.type === 'Polygon') {
-                        if (this.pointInPolygon(point, geometry.coordinates)) {
-                            return countryCode;
-                        }
-                    } else if (geometry.type === 'MultiPolygon') {
-                        if (this.pointInMultiPolygon(point, geometry.coordinates)) {
-                            return countryCode;
-                        }
-                    }
-                } catch (e) {
-                    continue;
-                }
-            }
-            return 'Unknown';
-        },
-
-        pointInPolygon(point, polygonCoords) {
-            if (!this.pointInRing(point, polygonCoords[0])) {
-                return false;
-            }
-
-            for (let i = 1; i < polygonCoords.length; i++) {
-                if (this.pointInRing(point, polygonCoords[i])) {
-                    return false;
-                }
-            }
-
-            return true;
-        },
-
-        pointInMultiPolygon(point, multiPolygonCoords) {
-            for (const polygonCoords of multiPolygonCoords) {
-                if (this.pointInPolygon(point, polygonCoords)) {
-                    return true;
-                }
-            }
-            return false;
-        },
-
-        pointInRing(point, ring) {
-            const [x, y] = point;
-            let inside = false;
-
-            for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-                const [xi, yi] = ring[i];
-                const [xj, yj] = ring[j];
-
-                const intersect = ((yi > y) !== (yj > y)) &&
-                    (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
-
-                if (intersect) inside = !inside;
-            }
-
-            return inside;
-        },
-
-        async getCountryFromAPI(lat, lng) {
-            try {
-                const response = await fetch(
-                    `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&zoom=3`
-                );
-                const data = await response.json();
-                return data.address?.country_code?.toUpperCase() || 'Unknown';
-            } catch (error) {
-                return 'Unknown';
-            }
-        },
-
-        getOfflinePreciseData() {
-            return {
-                'US': { geometry: { type: 'MultiPolygon', coordinates: [[[[-125, 49], [-125, 25], [-66, 25], [-66, 49], [-125, 49]]], [[[-170, 52], [-170, 71], [-130, 71], [-130, 52], [-170, 52]]], [[[-161, 18], [-161, 23], [-154, 23], [-154, 18], [-161, 18]]]] } },
-                'CA': { geometry: { type: 'Polygon', coordinates: [[[-141, 42], [-141, 84], [-52, 84], [-52, 42], [-141, 42]]] } },
-                'MX': { geometry: { type: 'Polygon', coordinates: [[[-118, 14], [-118, 33], [-86, 33], [-86, 14], [-118, 14]]] } },
-                'BR': { geometry: { type: 'Polygon', coordinates: [[[-74, -34], [-74, 5], [-35, 5], [-35, -34], [-74, -34]]] } },
-                'AR': { geometry: { type: 'Polygon', coordinates: [[[-74, -55], [-74, -21], [-53, -21], [-53, -55], [-74, -55]]] } },
-                'GB': { geometry: { type: 'MultiPolygon', coordinates: [[[[-8, 50], [-8, 61], [2, 61], [2, 50], [-8, 50]]], [[[-7, 54], [-7, 59], [-5, 59], [-5, 54], [-7, 54]]]] } },
-                'FR': { geometry: { type: 'Polygon', coordinates: [[[-5, 42], [-5, 51], [9, 51], [9, 42], [-5, 42]]] } },
-                'DE': { geometry: { type: 'Polygon', coordinates: [[[6, 47], [6, 55], [15, 55], [15, 47], [6, 47]]] } },
-                'IT': { geometry: { type: 'Polygon', coordinates: [[[6, 36], [6, 47], [19, 47], [19, 36], [6, 36]]] } },
-                'ES': { geometry: { type: 'Polygon', coordinates: [[[-9, 36], [-9, 44], [4, 44], [4, 36], [-9, 36]]] } },
-                'RU': { geometry: { type: 'Polygon', coordinates: [[[20, 41], [20, 82], [180, 82], [180, 41], [20, 41]]] } },
-                'CN': { geometry: { type: 'Polygon', coordinates: [[[73, 18], [73, 54], [135, 54], [135, 18], [73, 18]]] } },
-                'IN': { geometry: { type: 'Polygon', coordinates: [[[68, 8], [68, 37], [97, 37], [97, 8], [68, 8]]] } },
-                'AU': { geometry: { type: 'Polygon', coordinates: [[[113, -44], [113, -10], [154, -10], [154, -44], [113, -44]]] } },
-                'ZA': { geometry: { type: 'Polygon', coordinates: [[[16, -35], [16, -22], [33, -22], [33, -35], [16, -35]]] } },
-                'JP': { geometry: { type: 'MultiPolygon', coordinates: [[[[129, 31], [129, 46], [146, 46], [146, 31], [129, 31]]]] } },
-                'KR': { geometry: { type: 'Polygon', coordinates: [[[125, 33], [125, 39], [131, 39], [131, 33], [125, 33]]] } }
-            };
+    async function loadTurf() {
+        if (turfReady || window.turf) {
+            turfReady = true;
+            return;
         }
-    };
 
-    // ==================== CONFIGURATION ====================
-    const CONFIG = {
-        CHECK_INTERVAL: 5000,
-        STORAGE_KEY: 'geoguessr_stats_data'
-    };
+        return new Promise((resolve) => {
+            const script = document.createElement('script');
+            script.src = 'https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js';
+            script.onload = () => {
+                turfReady = true;
+                resolve();
+            };
+            script.onerror = resolve;
+            document.head.appendChild(script);
+        });
+    }
 
-    // ==================== DATA STORAGE ====================
-    let statsData = GM_getValue(CONFIG.STORAGE_KEY, []);
-    let currentGameToken = null;
-    let isMonitoring = false;
-    let isTracking = true;
-    let lastSavedGame = null;
+    async function loadCountries() {
+        if (countryData) return;
+        
+        await loadTurf();
+        
+        try {
+            const res = await fetch('https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_admin_0_countries.geojson');
+            const geo = await res.json();
+            
+            countryData = {};
+            geo.features.forEach(f => {
+                const code = f.properties.ISO_A2 || f.properties.iso_a2 || f.properties.ISO_A2_EH;
+                if (code && code !== '-99' && code.length === 2) {
+                    countryData[code.toUpperCase()] = {
+                        geometry: f.geometry,
+                        properties: f.properties
+                    };
+                }
+            });
+        } catch (e) {
+            console.warn('Failed to load country data:', e);
+            countryData = {};
+        }
+    }
 
-    // ==================== SHARED UI CONTAINER ====================
-    function getOrCreateToolbar() {
+    function getCountry(lat, lng) {
+        if (!countryData || lat == null || lng == null) return 'Unknown';
+        
+        lng = ((lng + 180) % 360 + 360) % 360 - 180;
+
+        if (turfReady && window.turf) {
+            const pt = window.turf.point([lng, lat]);
+            
+            for (const [code, data] of Object.entries(countryData)) {
+                try {
+                    if (window.turf.booleanPointInPolygon(pt, data.geometry)) {
+                        return code;
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+
+            let nearest = 'Unknown';
+            let minDist = Infinity;
+            
+            for (const [code, data] of Object.entries(countryData)) {
+                try {
+                    const dist = window.turf.pointToLineDistance(pt, data.geometry, {units: 'kilometers'});
+                    if (dist < minDist && dist < 10) {
+                        minDist = dist;
+                        nearest = code;
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+            
+            return nearest;
+        }
+
+        const pt = [lng, lat];
+        for (const [code, data] of Object.entries(countryData)) {
+            const geom = data.geometry;
+            if (geom.type === 'Polygon' && pointInPoly(pt, geom.coordinates)) {
+                return code;
+            } else if (geom.type === 'MultiPolygon') {
+                for (const poly of geom.coordinates) {
+                    if (pointInPoly(pt, poly)) return code;
+                }
+            }
+        }
+        
+        return 'Unknown';
+    }
+
+    function pointInPoly(pt, coords) {
+        if (!pointInRing(pt, coords[0])) return false;
+        for (let i = 1; i < coords.length; i++) {
+            if (pointInRing(pt, coords[i])) return false;
+        }
+        return true;
+    }
+
+    function pointInRing(pt, ring) {
+        const [x, y] = pt;
+        let inside = false;
+        
+        for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+            const [xi, yi] = ring[i];
+            const [xj, yj] = ring[j];
+            
+            if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) {
+                inside = !inside;
+            }
+        }
+        
+        return inside;
+    }
+
+    function getToolbar() {
         let toolbar = document.getElementById('geoguessr-toolbar');
         if (!toolbar) {
             toolbar = document.createElement('div');
@@ -359,10 +169,10 @@
         return toolbar;
     }
 
-    function addButtonToToolbar(button) {
-        const toolbar = getOrCreateToolbar();
-
-        button.style.cssText = `
+    function addButton(btn) {
+        const toolbar = getToolbar();
+        
+        btn.style.cssText = `
             width: 40px !important;
             height: 40px !important;
             border-radius: 50% !important;
@@ -378,36 +188,35 @@
             flex-shrink: 0;
         `;
 
-        button.addEventListener('mouseenter', function() {
+        btn.onmouseenter = function() {
             this.style.transform = 'scale(1.1)';
             this.style.boxShadow = '0 4px 12px rgba(0, 0, 0, 0.4)';
-        });
-
-        button.addEventListener('mouseleave', function() {
+        };
+        
+        btn.onmouseleave = function() {
             this.style.transform = 'scale(1)';
             this.style.boxShadow = '0 2px 8px rgba(0,0,0,0.3)';
-        });
+        };
 
-        const existingButton = document.getElementById(button.id);
-        if (!existingButton) {
-            toolbar.appendChild(button);
+        if (!document.getElementById(btn.id)) {
+            toolbar.appendChild(btn);
         }
     }
 
-    function startUrlMonitoring() {
-        let currentUrl = window.location.href;
-
+    function watchUrl() {
+        let url = window.location.href;
+        
         setInterval(() => {
-            if (window.location.href !== currentUrl) {
-                currentUrl = window.location.href;
-                handleUrlChange(currentUrl);
+            if (window.location.href !== url) {
+                url = window.location.href;
+                checkUrl(url);
             }
         }, 1000);
-
-        handleUrlChange(currentUrl);
+        
+        checkUrl(url);
     }
 
-    function handleUrlChange(url) {
+    function checkUrl(url) {
         const patterns = [
             /\/game\/([a-zA-Z0-9_-]+)/,
             /\/challenge\/([a-zA-Z0-9_-]+)/,
@@ -419,58 +228,54 @@
             const match = url.match(pattern);
             if (match) {
                 const token = match[1];
-                if (token !== currentGameToken) {
-                    currentGameToken = token;
-                    updateStatus('Game: ' + currentGameToken.substring(0, 8) + '...');
-                    updateGameInfo(); // Update to show current tracking
-
-                    if (!isMonitoring) {
-                        startGameMonitoring();
-                    }
+                if (token !== activeToken) {
+                    activeToken = token;
+                    setStatus('Game: ' + activeToken.substring(0, 8) + '...');
+                    updateGameInfo();
+                    
+                    if (!monitoring) startMonitoring();
                 }
                 break;
             }
         }
     }
 
-    function startGameMonitoring() {
-        if (isMonitoring || !currentGameToken) return;
+    function startMonitoring() {
+        if (monitoring || !activeToken) return;
+        monitoring = true;
 
-        isMonitoring = true;
-
-        const monitorInterval = setInterval(async () => {
-            if (!currentGameToken || !isTracking) {
-                clearInterval(monitorInterval);
-                isMonitoring = false;
+        const check = setInterval(async () => {
+            if (!activeToken || !tracking) {
+                clearInterval(check);
+                monitoring = false;
                 return;
             }
 
             try {
-                const gameData = await fetchGameData(currentGameToken);
-                if (gameData && gameData.state === 'finished') {
-                    await saveGame(gameData);
-                    currentGameToken = null;
-                    clearInterval(monitorInterval);
-                    isMonitoring = false;
+                const data = await fetchGame(activeToken);
+                if (data && data.state === 'finished') {
+                    await saveGame(data);
+                    activeToken = null;
+                    clearInterval(check);
+                    monitoring = false;
                 }
-            } catch (error) {
-                console.error('Monitoring error:', error);
+            } catch (e) {
+                console.error('Monitor error:', e);
             }
-        }, CONFIG.CHECK_INTERVAL);
+        }, POLL_MS);
     }
 
-    async function fetchGameData(token) {
+    async function fetchGame(token) {
         return new Promise((resolve, reject) => {
             GM_xmlhttpRequest({
                 method: 'GET',
                 url: `https://www.geoguessr.com/api/v3/games/${token}`,
                 headers: { 'Accept': 'application/json' },
-                onload: function(response) {
-                    if (response.status >= 200 && response.status < 300) {
+                onload: function(res) {
+                    if (res.status >= 200 && res.status < 300) {
                         try {
-                            const data = JSON.parse(response.responseText);
-                            resolve(data);
-                        } catch (error) {
+                            resolve(JSON.parse(res.responseText));
+                        } catch (e) {
                             resolve(null);
                         }
                     } else {
@@ -482,119 +287,102 @@
         });
     }
 
-    async function saveGame(gameData) {
-        if (!gameData || !gameData.token) return;
+    async function saveGame(data) {
+        if (!data || !data.token || games.find(g => g.token === data.token)) return;
 
-        if (statsData.find(g => g.token === gameData.token)) {
-            return;
-        }
+        const formatted = await formatGame(data);
+        games.push(formatted);
+        GM_setValue(STORAGE_KEY, games);
 
-        const formattedGame = await formatGameData(gameData);
-        statsData.push(formattedGame);
-        GM_setValue(CONFIG.STORAGE_KEY, statsData);
-
-        lastSavedGame = formattedGame;
-        updateStatus(`✅ Saved! Score: ${formattedGame.totalScore}`);
-        updateSummary();
+        lastGame = formatted;
+        setStatus(`✅ Saved! Score: ${formatted.totalScore}`);
+        updateStats();
         updateGameInfo();
-        showNotification(`Game saved! Score: ${formattedGame.totalScore}`, 'success');
-
-        window.dispatchEvent(new CustomEvent('geoguessr-game-saved', {
-            detail: { game: formattedGame }
-        }));
+        notify(`Game saved! Score: ${formatted.totalScore}`, 'success');
     }
 
-    async function formatGameData(gameData) {
-        const player = gameData.player || {};
+    async function formatGame(data) {
+        const player = data.player || {};
         const rounds = [];
 
-        if (gameData.rounds && player.guesses) {
-            for (let index = 0; index < gameData.rounds.length; index++) {
-                const round = gameData.rounds[index];
-                const guess = player.guesses[index] || {};
+        if (data.rounds && player.guesses) {
+            for (let i = 0; i < data.rounds.length; i++) {
+                const r = data.rounds[i];
+                const g = player.guesses[i] || {};
 
-                const actualCountry = (round.streakLocationCode || 'Unknown').toUpperCase();
-                const guessedCountry = await CountryGeocoder.getCountry(guess.lat, guess.lng);
+                const actual = (r.streakLocationCode || 'Unknown').toUpperCase();
+                const guessed = getCountry(g.lat, g.lng);
 
                 rounds.push({
-                    roundNumber: index + 1,
-                    actual: {
-                        country: actualCountry,
-                        lat: round.lat,
-                        lng: round.lng
-                    },
-                    guessed: {
-                        country: guessedCountry,
-                        lat: guess.lat,
-                        lng: guess.lng
-                    },
-                    distance: Math.round(guess.distanceInMeters || 0),
-                    score: guess.roundScoreInPoints || 0,
-                    time: guess.time || 0,
-                    timedOut: guess.timedOut || false
+                    roundNumber: i + 1,
+                    actual: { country: actual, lat: r.lat, lng: r.lng },
+                    guessed: { country: guessed, lat: g.lat, lng: g.lng },
+                    distance: Math.round(g.distanceInMeters || 0),
+                    score: g.roundScoreInPoints || 0,
+                    time: g.time || 0,
+                    timedOut: g.timedOut || false
                 });
             }
         }
 
         return {
-            token: gameData.token,
+            token: data.token,
             timestamp: new Date().toISOString(),
-            gameMode: getGameMode(gameData),
-            map: gameData.mapName || 'Unknown',
+            gameMode: getMode(data),
+            map: data.mapName || 'Unknown',
             rounds: rounds,
             totalScore: player.totalScore?.amount || 0,
             totalDistance: Math.round(player.totalDistanceInMeters || 0),
             totalTime: player.totalTime || 0,
             restrictions: {
-                timeLimit: gameData.timeLimit || 0,
-                forbidMoving: gameData.forbidMoving || false,
-                forbidZooming: gameData.forbidZooming || false,
-                forbidRotating: gameData.forbidRotating || false
+                timeLimit: data.timeLimit || 0,
+                forbidMoving: data.forbidMoving || false,
+                forbidZooming: data.forbidZooming || false,
+                forbidRotating: data.forbidRotating || false
             }
         };
     }
 
-    function getGameMode(gameData) {
-        const { forbidMoving, forbidZooming, forbidRotating } = gameData;
+    function getMode(data) {
+        const { forbidMoving, forbidZooming, forbidRotating } = data;
         if (forbidMoving && forbidZooming && forbidRotating) return 'NMPZ';
         if (forbidMoving && !forbidZooming && !forbidRotating) return 'No Move';
         if (!forbidMoving && !forbidZooming && !forbidRotating) return 'Moving';
         return 'Custom';
     }
 
-    // ==================== IMPORT/EXPORT FUNCTIONS ====================
-    async function importRecentGames() {
-        const pagesToScan = prompt('How many pages to scan? (1 page = ~10 games)', '5');
-        if (!pagesToScan) return;
+    async function importGames() {
+        const pages = prompt('How many pages to scan? (1 page = ~10 games)', '5');
+        if (!pages) return;
 
-        const numPages = parseInt(pagesToScan) || 5;
+        const n = parseInt(pages) || 5;
         let imported = 0;
 
-        updateStatus('Importing...');
-        showNotification(`Scanning ${numPages} pages...`, 'info');
+        setStatus('Importing...');
+        notify(`Scanning ${n} pages...`, 'info');
 
         try {
-            for (let page = 0; page < numPages; page++) {
-                updateStatus(`Page ${page + 1}/${numPages}...`);
+            for (let p = 0; p < n; p++) {
+                setStatus(`Page ${p + 1}/${n}...`);
 
-                const response = await new Promise((resolve) => {
+                const res = await new Promise((resolve) => {
                     GM_xmlhttpRequest({
                         method: 'GET',
-                        url: `https://www.geoguessr.com/api/v3/user/activities?page=${page}&count=10`,
+                        url: `https://www.geoguessr.com/api/v3/user/activities?page=${p}&count=10`,
                         headers: { 'Accept': 'application/json' },
                         onload: resolve,
                         onerror: () => resolve({ status: 0 })
                     });
                 });
 
-                if (response.status === 200) {
-                    const activities = JSON.parse(response.responseText);
-                    for (const activity of activities) {
-                        if (activity.game) {
-                            const gameData = await fetchGameData(activity.game);
-                            if (gameData && gameData.state === 'finished') {
-                                if (!statsData.find(g => g.token === activity.game)) {
-                                    await saveGame(gameData);
+                if (res.status === 200) {
+                    const acts = JSON.parse(res.responseText);
+                    for (const act of acts) {
+                        if (act.game) {
+                            const data = await fetchGame(act.game);
+                            if (data && data.state === 'finished') {
+                                if (!games.find(g => g.token === act.game)) {
+                                    await saveGame(data);
                                     imported++;
                                 }
                             }
@@ -605,16 +393,16 @@
                 await new Promise(r => setTimeout(r, 500));
             }
 
-            updateStatus(`✅ Imported ${imported} games`);
-            showNotification(`Imported ${imported} new games!`, 'success');
-        } catch (error) {
-            console.error('Import error:', error);
-            showNotification('Import failed', 'error');
+            setStatus(`✅ Imported ${imported} games`);
+            notify(`Imported ${imported} new games!`, 'success');
+        } catch (e) {
+            console.error('Import error:', e);
+            notify('Import failed', 'error');
         }
     }
 
-    function exportToCSV() {
-        if (statsData.length === 0) {
+    function exportCSV() {
+        if (games.length === 0) {
             alert('No data to export!');
             return;
         }
@@ -627,53 +415,52 @@
             'Time Limit', 'No Move', 'No Zoom', 'No Pan'
         ];
 
-        let csvContent = headers.join(',') + '\n';
+        let csv = headers.join(',') + '\n';
 
-        statsData.forEach(game => {
-            game.rounds.forEach(round => {
+        games.forEach(g => {
+            g.rounds.forEach(r => {
                 const row = [
-                    game.timestamp, game.gameMode, `"${game.map}"`,
-                    game.totalScore, game.totalDistance, game.totalTime,
-                    round.roundNumber, round.actual.country, round.actual.lat, round.actual.lng,
-                    round.guessed.country, round.guessed.lat, round.guessed.lng,
-                    round.distance, round.score, round.time, round.timedOut,
-                    game.restrictions.timeLimit, game.restrictions.forbidMoving,
-                    game.restrictions.forbidZooming, game.restrictions.forbidRotating
+                    g.timestamp, g.gameMode, `"${g.map}"`,
+                    g.totalScore, g.totalDistance, g.totalTime,
+                    r.roundNumber, r.actual.country, r.actual.lat, r.actual.lng,
+                    r.guessed.country, r.guessed.lat, r.guessed.lng,
+                    r.distance, r.score, r.time, r.timedOut,
+                    g.restrictions.timeLimit, g.restrictions.forbidMoving,
+                    g.restrictions.forbidZooming, g.restrictions.forbidRotating
                 ];
-                csvContent += row.join(',') + '\n';
+                csv += row.join(',') + '\n';
             });
         });
 
-        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-        const url = window.URL.createObjectURL(blob);
+        const blob = new Blob([csv], { type: 'text/csv' });
+        const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
         a.download = `geoguessr_stats_${new Date().toISOString().split('T')[0]}.csv`;
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
-        window.URL.revokeObjectURL(url);
+        URL.revokeObjectURL(url);
 
-        showNotification(`Exported ${statsData.length} games`, 'success');
+        notify(`Exported ${games.length} games`, 'success');
     }
 
-    // ==================== UI FUNCTIONS ====================
     function createUI() {
         if (document.getElementById('stats-tracker-toggle')) return;
 
-        const toggleBtn = document.createElement('div');
-        toggleBtn.id = 'stats-tracker-toggle';
-        toggleBtn.className = 'geoguessr-toolbar-btn';
-        toggleBtn.innerHTML = '📊';
-        toggleBtn.title = 'GeoGuessr Stats Tracker';
+        const btn = document.createElement('div');
+        btn.id = 'stats-tracker-toggle';
+        btn.className = 'geoguessr-toolbar-btn';
+        btn.innerHTML = '📊';
+        btn.title = 'GeoGuessr Stats Tracker';
 
-        addButtonToToolbar(toggleBtn);
+        addButton(btn);
 
         const panel = document.createElement('div');
         panel.id = 'stats-tracker-panel';
         panel.style.display = 'none';
         panel.innerHTML = `
-            <h3>📊 Stats Tracker v3.3</h3>
+            <h3>📊 Stats Tracker v3.4</h3>
             <div id="tracker-status">✅ Ready</div>
             <div id="current-game-info">No active game</div>
 
@@ -689,95 +476,84 @@
         `;
         document.body.appendChild(panel);
 
-        // Click outside to close functionality
-        document.addEventListener('click', function(event) {
-            const panel = document.getElementById('stats-tracker-panel');
-            const toggleBtn = document.getElementById('stats-tracker-toggle');
+        document.addEventListener('click', function(e) {
+            const p = document.getElementById('stats-tracker-panel');
+            const b = document.getElementById('stats-tracker-toggle');
             
-            if (panel && panel.style.display !== 'none') {
-                if (!panel.contains(event.target) && !toggleBtn.contains(event.target)) {
-                    panel.style.display = 'none';
+            if (p && p.style.display !== 'none') {
+                if (!p.contains(e.target) && !b.contains(e.target)) {
+                    p.style.display = 'none';
                 }
             }
         });
 
-        toggleBtn.addEventListener('click', () => {
-            const isVisible = panel.style.display !== 'none';
-            panel.style.display = isVisible ? 'none' : 'block';
+        btn.onclick = () => {
+            const visible = panel.style.display !== 'none';
+            panel.style.display = visible ? 'none' : 'block';
+        };
 
-            if (!isVisible) {
-                const capturePanel = document.getElementById('capture-panel');
-                if (capturePanel) capturePanel.style.display = 'none';
-            }
-        });
+        document.getElementById('export-csv-btn').onclick = exportCSV;
+        document.getElementById('import-recent-btn').onclick = importGames;
+        document.getElementById('toggle-tracking-btn').onclick = toggleTracking;
+        document.getElementById('clear-data-btn').onclick = clearData;
 
-        document.getElementById('export-csv-btn')?.addEventListener('click', exportToCSV);
-        document.getElementById('import-recent-btn')?.addEventListener('click', importRecentGames);
-        document.getElementById('toggle-tracking-btn')?.addEventListener('click', toggleTracking);
-        document.getElementById('clear-data-btn')?.addEventListener('click', clearData);
-
-        updateSummary();
+        updateStats();
     }
 
     function toggleTracking() {
-        isTracking = !isTracking;
+        tracking = !tracking;
         const btn = document.getElementById('toggle-tracking-btn');
-        if (btn) {
-            btn.textContent = isTracking ? '⏸️ Pause Tracking' : '▶️ Resume Tracking';
-        }
-        showNotification(isTracking ? 'Tracking resumed' : 'Tracking paused', 'info');
+        btn.textContent = tracking ? '⏸️ Pause Tracking' : '▶️ Resume Tracking';
+        notify(tracking ? 'Tracking resumed' : 'Tracking paused', 'info');
     }
 
     function clearData() {
         if (confirm('Clear all tracked data? This cannot be undone.')) {
-            statsData = [];
-            GM_setValue(CONFIG.STORAGE_KEY, statsData);
-            updateSummary();
-            showNotification('All data cleared', 'warning');
+            games = [];
+            GM_setValue(STORAGE_KEY, games);
+            updateStats();
+            notify('All data cleared', 'warning');
         }
     }
 
-    function updateStatus(message) {
-        const statusEl = document.getElementById('tracker-status');
-        if (statusEl) statusEl.textContent = message;
+    function setStatus(msg) {
+        const el = document.getElementById('tracker-status');
+        if (el) el.textContent = msg;
     }
 
     function updateGameInfo() {
-        const infoEl = document.getElementById('current-game-info');
-        if (infoEl) {
-            if (currentGameToken) {
-                // Currently tracking a game
-                infoEl.innerHTML = `
-                    <strong>Currently Tracking:</strong><br>
-                    Game: ${currentGameToken.substring(0, 8)}...
-                `;
-            } else if (lastSavedGame) {
-                // Show last saved game
-                infoEl.innerHTML = `
-                    <strong>Last Game:</strong><br>
-                    Map: ${lastSavedGame.map}<br>
-                    Score: ${lastSavedGame.totalScore.toLocaleString()}<br>
-                    Mode: ${lastSavedGame.gameMode}
-                `;
-            } else {
-                // No active or previous game
-                infoEl.innerHTML = 'No active game';
-            }
+        const el = document.getElementById('current-game-info');
+        if (!el) return;
+        
+        if (activeToken) {
+            el.innerHTML = `
+                <strong>Currently Tracking:</strong><br>
+                Game: ${activeToken.substring(0, 8)}...
+            `;
+        } else if (lastGame) {
+            el.innerHTML = `
+                <strong>Last Game:</strong><br>
+                Map: ${lastGame.map}<br>
+                Score: ${lastGame.totalScore.toLocaleString()}<br>
+                Mode: ${lastGame.gameMode}
+            `;
+        } else {
+            el.innerHTML = 'No active game';
         }
     }
 
-    function updateSummary() {
-        const totalGames = statsData.length;
-        const totalRounds = statsData.reduce((sum, game) => sum + (game.rounds?.length || 0), 0);
+    function updateStats() {
+        const total = games.length;
+        const rounds = games.reduce((sum, g) => sum + (g.rounds?.length || 0), 0);
 
-        const totalGamesEl = document.getElementById('total-games');
-        const totalRoundsEl = document.getElementById('total-rounds');
+        const tg = document.getElementById('total-games');
+        const tr = document.getElementById('total-rounds');
 
-        if (totalGamesEl) totalGamesEl.textContent = totalGames;
-        if (totalRoundsEl) totalRoundsEl.textContent = totalRounds;
+        if (tg) tg.textContent = total;
+        if (tr) tr.textContent = rounds;
     }
 
-    function showNotification(message, type = 'info') {
+    function notify(msg, type = 'info') {
         const colors = {
             success: '#4CAF50',
             error: '#f44336',
@@ -785,8 +561,8 @@
             info: '#2196F3'
         };
 
-        const notification = document.createElement('div');
-        notification.style.cssText = `
+        const n = document.createElement('div');
+        n.style.cssText = `
             position: fixed;
             bottom: 20px;
             right: 20px;
@@ -800,16 +576,15 @@
             animation: slideIn 0.3s ease;
             max-width: 300px;
         `;
-        notification.textContent = message;
-        document.body.appendChild(notification);
+        n.textContent = msg;
+        document.body.appendChild(n);
 
         setTimeout(() => {
-            notification.style.animation = 'slideOut 0.3s ease';
-            setTimeout(() => notification.remove(), 300);
+            n.style.animation = 'slideOut 0.3s ease';
+            setTimeout(() => n.remove(), 300);
         }, 3000);
     }
 
-    // ==================== STYLES ====================
     GM_addStyle(`
         #geoguessr-toolbar {
             position: fixed !important;
@@ -936,15 +711,12 @@
         }
     `);
 
-    // ==================== INITIALIZATION ====================
     async function init() {
-        await CountryGeocoder.init();
+        await loadCountries();
         createUI();
-        startUrlMonitoring();
-        updateStatus('Ready to track');
-        updateGameInfo(); // Initialize game info display
-
-        window.geoguessrCurrentGame = () => currentGameToken;
+        watchUrl();
+        setStatus('Ready to track');
+        updateGameInfo();
     }
 
     if (document.readyState === 'loading') {

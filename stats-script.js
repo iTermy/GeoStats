@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         GeoGuessr Stats Tracker
+// @name         GeoGuessr Stats Tracker (Enhanced Geocoding)
 // @namespace    http://tampermonkey.net/
-// @version      3.1
-// @description  Track your GeoGuessr game performance and export statistics
+// @version      3.3
+// @description  Track your GeoGuessr game performance with high-precision country detection
 // @author       You
 // @match        https://www.geoguessr.com/*
 // @match        https://geoguessr.com/*
@@ -12,13 +12,318 @@
 // @grant        GM_xmlhttpRequest
 // @connect      www.geoguessr.com
 // @connect      geoguessr.com
+// @connect      cdn.jsdelivr.net
+// @connect      raw.githubusercontent.com
+// @connect      nominatim.openstreetmap.org
+// @connect      api.bigdatacloud.net
 // @run-at       document-idle
 // ==/UserScript==
 
 (function() {
     'use strict';
 
-    console.log('%c📊 GeoGuessr Stats Tracker v3.1 Loaded!', 'color: #4CAF50; font-weight: bold; font-size: 14px');
+    console.log('%c📊 GeoGuessr Stats Tracker v3.3 Loaded!', 'color: #4CAF50; font-weight: bold; font-size: 14px');
+
+    // ==================== ENHANCED GEOCODING SYSTEM ====================
+    const CountryGeocoder = {
+        polygons: null,
+        loading: false,
+        loaded: false,
+        turfLoaded: false,
+        useAPI: true,
+
+        async init() {
+            if (this.loaded || this.loading) return;
+            this.loading = true;
+
+            try {
+                await this.loadTurf();
+
+                const dataSources = [
+                    {
+                        name: 'Natural Earth 10m',
+                        url: 'https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_10m_admin_0_countries.geojson',
+                        resolution: '10m (~1-5km precision)'
+                    },
+                    {
+                        name: 'World Boundaries',
+                        url: 'https://raw.githubusercontent.com/datasets/geo-countries/master/data/countries.geojson',
+                        resolution: '50m (~5-10km precision)'
+                    },
+                    {
+                        name: 'Simplified Boundaries',
+                        url: 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json',
+                        resolution: '110m (~10-20km precision)',
+                        isTopoJSON: true
+                    }
+                ];
+
+                let dataLoaded = false;
+                for (const source of dataSources) {
+                    try {
+                        const response = await fetch(source.url);
+                        if (response.ok) {
+                            const data = await response.json();
+                            if (source.isTopoJSON) {
+                                await this.loadTopoJSON();
+                                this.polygons = await this.processTopoJSON(data);
+                            } else {
+                                this.polygons = this.processGeoJSON(data);
+                            }
+                            dataLoaded = true;
+                            break;
+                        }
+                    } catch (error) {
+                        continue;
+                    }
+                }
+
+                if (!dataLoaded) {
+                    this.polygons = this.getOfflinePreciseData();
+                }
+
+                this.loaded = true;
+            } catch (error) {
+                this.polygons = this.getOfflinePreciseData();
+                this.loaded = true;
+            }
+
+            this.loading = false;
+        },
+
+        async loadTurf() {
+            if (this.turfLoaded) return;
+
+            return new Promise((resolve) => {
+                const script = document.createElement('script');
+                script.src = 'https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js';
+                script.onload = () => {
+                    this.turfLoaded = true;
+                    resolve();
+                };
+                script.onerror = resolve;
+                document.head.appendChild(script);
+            });
+        },
+
+        async loadTopoJSON() {
+            return new Promise((resolve) => {
+                if (window.topojson) {
+                    resolve();
+                    return;
+                }
+
+                const script = document.createElement('script');
+                script.src = 'https://cdn.jsdelivr.net/npm/topojson-client@3';
+                script.onload = resolve;
+                script.onerror = resolve;
+                document.head.appendChild(script);
+            });
+        },
+
+        processGeoJSON(geoData) {
+            const countries = {};
+            if (!geoData.features) return countries;
+
+            geoData.features.forEach(feature => {
+                if (!feature.properties || !feature.geometry) return;
+
+                const iso2 = feature.properties.ISO_A2 ||
+                            feature.properties.iso_a2 ||
+                            feature.properties.ISO2 ||
+                            feature.properties.iso_3166_1_alpha_2 ||
+                            feature.properties.ISO_A2_EH;
+
+                if (!iso2 || iso2 === '-99' || iso2.length !== 2) return;
+
+                countries[iso2.toUpperCase()] = {
+                    geometry: feature.geometry,
+                    properties: feature.properties
+                };
+            });
+
+            return countries;
+        },
+
+        async processTopoJSON(topology) {
+            if (!window.topojson) return {};
+            try {
+                const geojson = window.topojson.feature(topology, topology.objects.countries);
+                return this.processGeoJSON(geojson);
+            } catch (error) {
+                return {};
+            }
+        },
+
+        async getCountry(lat, lng) {
+            if (lat === null || lng === null || lat === undefined || lng === undefined) {
+                return 'Unknown';
+            }
+
+            lng = ((lng + 180) % 360 + 360) % 360 - 180;
+
+            const polygonCountry = this.getCountryFromPolygons(lat, lng);
+            if (polygonCountry !== 'Unknown') {
+                return polygonCountry;
+            }
+
+            if (this.useAPI) {
+                try {
+                    const apiCountry = await this.getCountryFromAPI(lat, lng);
+                    if (apiCountry !== 'Unknown') {
+                        return apiCountry;
+                    }
+                } catch (error) {
+                    console.warn('API geocoding failed:', error);
+                }
+            }
+
+            return 'Unknown';
+        },
+
+        getCountryFromPolygons(lat, lng) {
+            if (!this.loaded || !this.polygons) return 'Unknown';
+            const point = [lng, lat];
+
+            if (this.turfLoaded && window.turf) {
+                return this.getCountryWithTurf(point);
+            }
+
+            return this.getCountryManual(point);
+        },
+
+        getCountryWithTurf(point) {
+            const turfPoint = window.turf.point(point);
+
+            for (const [countryCode, data] of Object.entries(this.polygons)) {
+                try {
+                    if (window.turf.booleanPointInPolygon(turfPoint, data.geometry)) {
+                        return countryCode;
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+
+            return this.findNearestCountry(point);
+        },
+
+        findNearestCountry(point) {
+            if (!this.turfLoaded || !window.turf) return 'Unknown';
+
+            const turfPoint = window.turf.point(point);
+            let nearestCountry = 'Unknown';
+            let minDistance = Infinity;
+
+            for (const [countryCode, data] of Object.entries(this.polygons)) {
+                try {
+                    const distance = window.turf.pointToLineDistance(turfPoint, data.geometry, {units: 'kilometers'});
+                    if (distance < minDistance && distance < 10) {
+                        minDistance = distance;
+                        nearestCountry = countryCode;
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+
+            return nearestCountry;
+        },
+
+        getCountryManual(point) {
+            for (const [countryCode, data] of Object.entries(this.polygons)) {
+                try {
+                    const geometry = data.geometry;
+                    if (geometry.type === 'Polygon') {
+                        if (this.pointInPolygon(point, geometry.coordinates)) {
+                            return countryCode;
+                        }
+                    } else if (geometry.type === 'MultiPolygon') {
+                        if (this.pointInMultiPolygon(point, geometry.coordinates)) {
+                            return countryCode;
+                        }
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+            return 'Unknown';
+        },
+
+        pointInPolygon(point, polygonCoords) {
+            if (!this.pointInRing(point, polygonCoords[0])) {
+                return false;
+            }
+
+            for (let i = 1; i < polygonCoords.length; i++) {
+                if (this.pointInRing(point, polygonCoords[i])) {
+                    return false;
+                }
+            }
+
+            return true;
+        },
+
+        pointInMultiPolygon(point, multiPolygonCoords) {
+            for (const polygonCoords of multiPolygonCoords) {
+                if (this.pointInPolygon(point, polygonCoords)) {
+                    return true;
+                }
+            }
+            return false;
+        },
+
+        pointInRing(point, ring) {
+            const [x, y] = point;
+            let inside = false;
+
+            for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+                const [xi, yi] = ring[i];
+                const [xj, yj] = ring[j];
+
+                const intersect = ((yi > y) !== (yj > y)) &&
+                    (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+
+                if (intersect) inside = !inside;
+            }
+
+            return inside;
+        },
+
+        async getCountryFromAPI(lat, lng) {
+            try {
+                const response = await fetch(
+                    `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&zoom=3`
+                );
+                const data = await response.json();
+                return data.address?.country_code?.toUpperCase() || 'Unknown';
+            } catch (error) {
+                return 'Unknown';
+            }
+        },
+
+        getOfflinePreciseData() {
+            return {
+                'US': { geometry: { type: 'MultiPolygon', coordinates: [[[[-125, 49], [-125, 25], [-66, 25], [-66, 49], [-125, 49]]], [[[-170, 52], [-170, 71], [-130, 71], [-130, 52], [-170, 52]]], [[[-161, 18], [-161, 23], [-154, 23], [-154, 18], [-161, 18]]]] } },
+                'CA': { geometry: { type: 'Polygon', coordinates: [[[-141, 42], [-141, 84], [-52, 84], [-52, 42], [-141, 42]]] } },
+                'MX': { geometry: { type: 'Polygon', coordinates: [[[-118, 14], [-118, 33], [-86, 33], [-86, 14], [-118, 14]]] } },
+                'BR': { geometry: { type: 'Polygon', coordinates: [[[-74, -34], [-74, 5], [-35, 5], [-35, -34], [-74, -34]]] } },
+                'AR': { geometry: { type: 'Polygon', coordinates: [[[-74, -55], [-74, -21], [-53, -21], [-53, -55], [-74, -55]]] } },
+                'GB': { geometry: { type: 'MultiPolygon', coordinates: [[[[-8, 50], [-8, 61], [2, 61], [2, 50], [-8, 50]]], [[[-7, 54], [-7, 59], [-5, 59], [-5, 54], [-7, 54]]]] } },
+                'FR': { geometry: { type: 'Polygon', coordinates: [[[-5, 42], [-5, 51], [9, 51], [9, 42], [-5, 42]]] } },
+                'DE': { geometry: { type: 'Polygon', coordinates: [[[6, 47], [6, 55], [15, 55], [15, 47], [6, 47]]] } },
+                'IT': { geometry: { type: 'Polygon', coordinates: [[[6, 36], [6, 47], [19, 47], [19, 36], [6, 36]]] } },
+                'ES': { geometry: { type: 'Polygon', coordinates: [[[-9, 36], [-9, 44], [4, 44], [4, 36], [-9, 36]]] } },
+                'RU': { geometry: { type: 'Polygon', coordinates: [[[20, 41], [20, 82], [180, 82], [180, 41], [20, 41]]] } },
+                'CN': { geometry: { type: 'Polygon', coordinates: [[[73, 18], [73, 54], [135, 54], [135, 18], [73, 18]]] } },
+                'IN': { geometry: { type: 'Polygon', coordinates: [[[68, 8], [68, 37], [97, 37], [97, 8], [68, 8]]] } },
+                'AU': { geometry: { type: 'Polygon', coordinates: [[[113, -44], [113, -10], [154, -10], [154, -44], [113, -44]]] } },
+                'ZA': { geometry: { type: 'Polygon', coordinates: [[[16, -35], [16, -22], [33, -22], [33, -35], [16, -35]]] } },
+                'JP': { geometry: { type: 'MultiPolygon', coordinates: [[[[129, 31], [129, 46], [146, 46], [146, 31], [129, 31]]]] } },
+                'KR': { geometry: { type: 'Polygon', coordinates: [[[125, 33], [125, 39], [131, 39], [131, 33], [125, 33]]] } }
+            };
+        }
+    };
 
     // ==================== CONFIGURATION ====================
     const CONFIG = {
@@ -31,79 +336,76 @@
     let currentGameToken = null;
     let isMonitoring = false;
     let isTracking = true;
-
-    console.log('📊 Found', statsData.length, 'saved games');
+    let lastSavedGame = null;
 
     // ==================== SHARED UI CONTAINER ====================
     function getOrCreateToolbar() {
-    let toolbar = document.getElementById('geoguessr-toolbar');
-    if (!toolbar) {
-        toolbar = document.createElement('div');
-        toolbar.id = 'geoguessr-toolbar';
-        toolbar.style.cssText = `
-            position: fixed;
-            top: 80px; /* Positioned right under the GeoGuessr banner */
-            right: 20px;
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-            z-index: 2147483647;
-            align-items: center;
+        let toolbar = document.getElementById('geoguessr-toolbar');
+        if (!toolbar) {
+            toolbar = document.createElement('div');
+            toolbar.id = 'geoguessr-toolbar';
+            toolbar.style.cssText = `
+                position: fixed;
+                top: 80px;
+                right: 20px;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                z-index: 2147483647;
+                align-items: center;
+            `;
+            document.body.appendChild(toolbar);
+        }
+        return toolbar;
+    }
+
+    function addButtonToToolbar(button) {
+        const toolbar = getOrCreateToolbar();
+
+        button.style.cssText = `
+            width: 40px !important;
+            height: 40px !important;
+            border-radius: 50% !important;
+            cursor: pointer !important;
+            font-size: 18px !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3) !important;
+            transition: all 0.3s ease !important;
+            border: 1px solid rgba(255, 255, 255, 0.3) !important;
+            user-select: none !important;
+            flex-shrink: 0;
         `;
-        document.body.appendChild(toolbar);
+
+        button.addEventListener('mouseenter', function() {
+            this.style.transform = 'scale(1.1)';
+            this.style.boxShadow = '0 4px 12px rgba(0, 0, 0, 0.4)';
+        });
+
+        button.addEventListener('mouseleave', function() {
+            this.style.transform = 'scale(1)';
+            this.style.boxShadow = '0 2px 8px rgba(0,0,0,0.3)';
+        });
+
+        const existingButton = document.getElementById(button.id);
+        if (!existingButton) {
+            toolbar.appendChild(button);
+        }
     }
-    return toolbar;
-}
-   function addButtonToToolbar(button) {
-    const toolbar = getOrCreateToolbar();
-
-    // Smaller button styling
-    button.style.cssText = `
-        width: 40px !important;
-        height: 40px !important;
-        border-radius: 50% !important;
-        cursor: pointer !important;
-        font-size: 18px !important;
-        display: flex !important;
-        align-items: center !important;
-        justify-content: center !important;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.3) !important;
-        transition: all 0.3s ease !important;
-        border: 1px solid rgba(255, 255, 255, 0.3) !important;
-        user-select: none !important;
-        flex-shrink: 0;
-    `;
-
-    // Add hover effects
-    button.addEventListener('mouseenter', function() {
-        this.style.transform = 'scale(1.1)';
-        this.style.boxShadow = '0 4px 12px rgba(0, 0, 0, 0.4)';
-    });
-
-    button.addEventListener('mouseleave', function() {
-        this.style.transform = 'scale(1)';
-        this.style.boxShadow = '0 2px 8px rgba(0,0,0,0.3)';
-    });
-
-    // Check if button already exists to avoid duplicates
-    const existingButton = document.getElementById(button.id);
-    if (!existingButton) {
-        toolbar.appendChild(button);
-    }
-}
 
     function startUrlMonitoring() {
-    let currentUrl = window.location.href;
+        let currentUrl = window.location.href;
 
-    setInterval(() => {
-        if (window.location.href !== currentUrl) {
-            currentUrl = window.location.href;
-            handleUrlChange(currentUrl);
-        }
-    }, 1000);
+        setInterval(() => {
+            if (window.location.href !== currentUrl) {
+                currentUrl = window.location.href;
+                handleUrlChange(currentUrl);
+            }
+        }, 1000);
 
-    handleUrlChange(currentUrl); // Check current URL on init
-}
+        handleUrlChange(currentUrl);
+    }
 
     function handleUrlChange(url) {
         const patterns = [
@@ -119,8 +421,8 @@
                 const token = match[1];
                 if (token !== currentGameToken) {
                     currentGameToken = token;
-                    console.log('🎮 Game detected:', currentGameToken);
                     updateStatus('Game: ' + currentGameToken.substring(0, 8) + '...');
+                    updateGameInfo(); // Update to show current tracking
 
                     if (!isMonitoring) {
                         startGameMonitoring();
@@ -135,7 +437,6 @@
         if (isMonitoring || !currentGameToken) return;
 
         isMonitoring = true;
-        console.log('🔄 Monitoring game:', currentGameToken);
 
         const monitorInterval = setInterval(async () => {
             if (!currentGameToken || !isTracking) {
@@ -147,14 +448,13 @@
             try {
                 const gameData = await fetchGameData(currentGameToken);
                 if (gameData && gameData.state === 'finished') {
-                    console.log('✅ Game finished, saving...');
-                    saveGame(gameData);
+                    await saveGame(gameData);
                     currentGameToken = null;
                     clearInterval(monitorInterval);
                     isMonitoring = false;
                 }
             } catch (error) {
-                console.error('❌ Monitoring error:', error);
+                console.error('Monitoring error:', error);
             }
         }, CONFIG.CHECK_INTERVAL);
     }
@@ -182,45 +482,49 @@
         });
     }
 
-    function saveGame(gameData) {
+    async function saveGame(gameData) {
         if (!gameData || !gameData.token) return;
 
         if (statsData.find(g => g.token === gameData.token)) {
-            console.log('Game already saved');
             return;
         }
 
-        const formattedGame = formatGameData(gameData);
+        const formattedGame = await formatGameData(gameData);
         statsData.push(formattedGame);
         GM_setValue(CONFIG.STORAGE_KEY, statsData);
 
+        lastSavedGame = formattedGame;
         updateStatus(`✅ Saved! Score: ${formattedGame.totalScore}`);
         updateSummary();
-        updateGameInfo(formattedGame);
+        updateGameInfo();
         showNotification(`Game saved! Score: ${formattedGame.totalScore}`, 'success');
 
-        // Broadcast event for other scripts (like screen capture)
         window.dispatchEvent(new CustomEvent('geoguessr-game-saved', {
             detail: { game: formattedGame }
         }));
     }
 
-    function formatGameData(gameData) {
+    async function formatGameData(gameData) {
         const player = gameData.player || {};
         const rounds = [];
 
         if (gameData.rounds && player.guesses) {
-            gameData.rounds.forEach((round, index) => {
+            for (let index = 0; index < gameData.rounds.length; index++) {
+                const round = gameData.rounds[index];
                 const guess = player.guesses[index] || {};
+
+                const actualCountry = (round.streakLocationCode || 'Unknown').toUpperCase();
+                const guessedCountry = await CountryGeocoder.getCountry(guess.lat, guess.lng);
+
                 rounds.push({
                     roundNumber: index + 1,
                     actual: {
-                        country: round.streakLocationCode || 'Unknown',
+                        country: actualCountry,
                         lat: round.lat,
                         lng: round.lng
                     },
                     guessed: {
-                        country: guess.streakLocationCode || 'Unknown',
+                        country: guessedCountry,
                         lat: guess.lat,
                         lng: guess.lng
                     },
@@ -229,7 +533,7 @@
                     time: guess.time || 0,
                     timedOut: guess.timedOut || false
                 });
-            });
+            }
         }
 
         return {
@@ -290,7 +594,7 @@
                             const gameData = await fetchGameData(activity.game);
                             if (gameData && gameData.state === 'finished') {
                                 if (!statsData.find(g => g.token === activity.game)) {
-                                    saveGame(gameData);
+                                    await saveGame(gameData);
                                     imported++;
                                 }
                             }
@@ -357,31 +661,26 @@
     function createUI() {
         if (document.getElementById('stats-tracker-toggle')) return;
 
-        // Create toggle button for toolbar
         const toggleBtn = document.createElement('div');
         toggleBtn.id = 'stats-tracker-toggle';
         toggleBtn.className = 'geoguessr-toolbar-btn';
         toggleBtn.innerHTML = '📊';
         toggleBtn.title = 'GeoGuessr Stats Tracker';
 
-        // Add button to shared toolbar
         addButtonToToolbar(toggleBtn);
 
-        // Create main panel
         const panel = document.createElement('div');
         panel.id = 'stats-tracker-panel';
         panel.style.display = 'none';
         panel.innerHTML = `
-            <h3>📊 Stats Tracker</h3>
+            <h3>📊 Stats Tracker v3.3</h3>
             <div id="tracker-status">✅ Ready</div>
             <div id="current-game-info">No active game</div>
 
             <button id="export-csv-btn">📥 Export to CSV</button>
             <button id="import-recent-btn">📤 Import Recent Games</button>
-            <button id="test-api-btn">🔧 Test API Connection</button>
-
-            <button id="clear-data-btn">🗑️ Clear Data</button>
             <button id="toggle-tracking-btn">⏸️ Pause Tracking</button>
+            <button id="clear-data-btn">🗑️ Clear Data</button>
 
             <div id="stats-summary">
                 <p><strong>Games tracked:</strong> <span id="total-games">0</span></p>
@@ -390,12 +689,22 @@
         `;
         document.body.appendChild(panel);
 
-        // Add event listeners
+        // Click outside to close functionality
+        document.addEventListener('click', function(event) {
+            const panel = document.getElementById('stats-tracker-panel');
+            const toggleBtn = document.getElementById('stats-tracker-toggle');
+            
+            if (panel && panel.style.display !== 'none') {
+                if (!panel.contains(event.target) && !toggleBtn.contains(event.target)) {
+                    panel.style.display = 'none';
+                }
+            }
+        });
+
         toggleBtn.addEventListener('click', () => {
             const isVisible = panel.style.display !== 'none';
             panel.style.display = isVisible ? 'none' : 'block';
 
-            // Close other panels when opening this one
             if (!isVisible) {
                 const capturePanel = document.getElementById('capture-panel');
                 if (capturePanel) capturePanel.style.display = 'none';
@@ -404,12 +713,10 @@
 
         document.getElementById('export-csv-btn')?.addEventListener('click', exportToCSV);
         document.getElementById('import-recent-btn')?.addEventListener('click', importRecentGames);
-        document.getElementById('test-api-btn')?.addEventListener('click', testAPIConnection);
-        document.getElementById('clear-data-btn')?.addEventListener('click', clearData);
         document.getElementById('toggle-tracking-btn')?.addEventListener('click', toggleTracking);
+        document.getElementById('clear-data-btn')?.addEventListener('click', clearData);
 
         updateSummary();
-        showNotification('Stats Tracker loaded!', 'success');
     }
 
     function toggleTracking() {
@@ -430,33 +737,33 @@
         }
     }
 
-    async function testAPIConnection() {
-        updateStatus('Testing API...');
-        try {
-            const response = await new Promise((resolve) => {
-                GM_xmlhttpRequest({
-                    method: 'GET',
-                    url: 'https://www.geoguessr.com/api/v3/profiles/user',
-                    headers: { 'Accept': 'application/json' },
-                    onload: resolve,
-                    onerror: () => resolve({ status: 0 })
-                });
-            });
-
-            if (response.status === 200) {
-                const data = JSON.parse(response.responseText);
-                showNotification(`✅ API working! User: ${data.nick || 'Unknown'}`, 'success');
-            } else {
-                showNotification('API connection failed', 'error');
-            }
-        } catch (error) {
-            showNotification('API test failed', 'error');
-        }
-    }
-
     function updateStatus(message) {
         const statusEl = document.getElementById('tracker-status');
         if (statusEl) statusEl.textContent = message;
+    }
+
+    function updateGameInfo() {
+        const infoEl = document.getElementById('current-game-info');
+        if (infoEl) {
+            if (currentGameToken) {
+                // Currently tracking a game
+                infoEl.innerHTML = `
+                    <strong>Currently Tracking:</strong><br>
+                    Game: ${currentGameToken.substring(0, 8)}...
+                `;
+            } else if (lastSavedGame) {
+                // Show last saved game
+                infoEl.innerHTML = `
+                    <strong>Last Game:</strong><br>
+                    Map: ${lastSavedGame.map}<br>
+                    Score: ${lastSavedGame.totalScore.toLocaleString()}<br>
+                    Mode: ${lastSavedGame.gameMode}
+                `;
+            } else {
+                // No active or previous game
+                infoEl.innerHTML = 'No active game';
+            }
+        }
     }
 
     function updateSummary() {
@@ -468,18 +775,6 @@
 
         if (totalGamesEl) totalGamesEl.textContent = totalGames;
         if (totalRoundsEl) totalRoundsEl.textContent = totalRounds;
-    }
-
-    function updateGameInfo(game) {
-        const infoEl = document.getElementById('current-game-info');
-        if (infoEl && game) {
-            infoEl.innerHTML = `
-                <strong>Last Game:</strong><br>
-                Map: ${game.map}<br>
-                Score: ${game.totalScore.toLocaleString()}<br>
-                Mode: ${game.gameMode}
-            `;
-        }
     }
 
     function showNotification(message, type = 'info') {
@@ -516,221 +811,142 @@
 
     // ==================== STYLES ====================
     GM_addStyle(`
-     #geoguessr-toolbar {
-    position: fixed !important;
-    top: 90px !important; /* Right under the GeoGuessr banner */
-    right: 15px !important;
-    display: flex !important;
-    flex-direction: column !important;
-    gap: 8px !important;
-    z-index: 2147483647 !important;
-    align-items: center !important;
-    background: rgba(0, 0, 0, 0.7) !important;
-    padding: 10px 8px !important;
-    border-radius: 20px !important;
-    backdrop-filter: blur(10px) !important;
-    border: 1px solid rgba(255, 255, 255, 0.2) !important;
-    transition: all 0.3s ease !important;
-}
+        #geoguessr-toolbar {
+            position: fixed !important;
+            top: 90px !important;
+            right: 15px !important;
+            display: flex !important;
+            flex-direction: column !important;
+            gap: 8px !important;
+            z-index: 2147483647 !important;
+            align-items: center !important;
+            background: rgba(0, 0, 0, 0.7) !important;
+            padding: 10px 8px !important;
+            border-radius: 20px !important;
+            backdrop-filter: blur(10px) !important;
+            border: 1px solid rgba(255, 255, 255, 0.2) !important;
+            transition: all 0.3s ease !important;
+        }
 
-.geoguessr-toolbar-btn {
-    width: 40px !important;
-    height: 40px !important;
-    border-radius: 50% !important;
-    cursor: pointer !important;
-    font-size: 18px !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.3) !important;
-    transition: all 0.3s ease !important;
-    border: 1px solid rgba(255, 255, 255, 0.3) !important;
-    user-select: none !important;
-    flex-shrink: 0 !important;
-}
+        .geoguessr-toolbar-btn {
+            width: 40px !important;
+            height: 40px !important;
+            border-radius: 50% !important;
+            cursor: pointer !important;
+            font-size: 18px !important;
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3) !important;
+            transition: all 0.3s ease !important;
+            border: 1px solid rgba(255, 255, 255, 0.3) !important;
+            user-select: none !important;
+            flex-shrink: 0 !important;
+        }
 
-#capture-toggle {
-    background: linear-gradient(135deg, #2196F3, #1976D2) !important;
-    color: white !important;
-}
+        #stats-tracker-toggle {
+            background: linear-gradient(135deg, #4CAF50, #45a049) !important;
+            color: white !important;
+        }
 
-#stats-tracker-toggle {
-    background: linear-gradient(135deg, #4CAF50, #45a049) !important;
-    color: white !important;
-}
+        .geoguessr-toolbar-btn:hover {
+            transform: scale(1.1) !important;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4) !important;
+        }
 
-.geoguessr-toolbar-btn:hover {
-    transform: scale(1.1) !important;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4) !important;
-}
+        #stats-tracker-panel {
+            position: fixed !important;
+            top: 140px !important;
+            right: 90px !important;
+            background: rgba(20, 20, 20, 0.95) !important;
+            color: white !important;
+            padding: 12px !important;
+            border-radius: 8px !important;
+            z-index: 2147483646 !important;
+            min-width: 220px !important;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
+            border: 2px solid #4CAF50 !important;
+            backdrop-filter: blur(10px) !important;
+        }
 
-#capture-toggle:hover {
-    box-shadow: 0 4px 12px rgba(33, 150, 243, 0.4) !important;
-}
+        #stats-tracker-panel h3 {
+            margin: 0 0 8px 0 !important;
+            color: #4CAF50 !important;
+            font-size: 16px !important;
+            font-weight: bold !important;
+        }
 
-#stats-tracker-toggle:hover {
-    box-shadow: 0 4px 12px rgba(76, 175, 80, 0.4) !important;
-}
+        #stats-tracker-panel button {
+            display: block !important;
+            width: 100% !important;
+            margin: 4px 0 !important;
+            padding: 6px 10px !important;
+            background: #4CAF50 !important;
+            color: white !important;
+            border: none !important;
+            border-radius: 4px !important;
+            cursor: pointer !important;
+            font-size: 13px !important;
+            font-weight: 500 !important;
+            transition: all 0.2s !important;
+        }
 
-/* Update panel positioning to be below the toolbar */
-#capture-panel, #stats-tracker-panel {
-    position: fixed !important;
-    top: 140px !important; /* Below the toolbar */
-    right: 90px !important;
-    background: rgba(20, 20, 20, 0.95) !important;
-    color: white !important;
-    padding: 12px !important;
-    border-radius: 8px !important;
-    z-index: 2147483646 !important;
-    min-width: 220px !important;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
-    border: 2px solid #2196F3 !important;
-    backdrop-filter: blur(10px) !important;
-}
+        #stats-tracker-panel button:hover {
+            transform: translateY(-1px) !important;
+            background: #45a049 !important;
+        }
 
-#stats-tracker-panel {
-    border-color: #4CAF50 !important;
-}
+        #clear-data-btn {
+            background: #f44336 !important;
+        }
 
-#capture-panel *,
-#stats-tracker-panel * {
-    box-sizing: border-box !important;
-}
+        #clear-data-btn:hover {
+            background: #da190b !important;
+        }
 
-#capture-panel h3,
-#stats-tracker-panel h3 {
-    margin: 0 0 8px 0 !important;
-    color: #2196F3 !important;
-    font-size: 16px !important;
-    font-weight: bold !important;
-}
+        #tracker-status {
+            padding: 6px !important;
+            margin: 6px 0 !important;
+            background: rgba(255, 255, 255, 0.1) !important;
+            border: 1px solid rgba(255, 255, 255, 0.2) !important;
+            border-radius: 4px !important;
+            text-align: center !important;
+            font-size: 12px !important;
+            font-weight: 500 !important;
+        }
 
-#stats-tracker-panel h3 {
-    color: #4CAF50 !important;
-}
+        #current-game-info, #stats-summary {
+            font-size: 11px !important;
+            margin: 8px 0 !important;
+            padding: 6px !important;
+            background: rgba(255, 255, 255, 0.05) !important;
+            border-radius: 4px !important;
+            line-height: 1.4 !important;
+        }
 
-#capture-panel button,
-#stats-tracker-panel button {
-    display: block !important;
-    width: 100% !important;
-    margin: 4px 0 !important;
-    padding: 6px 10px !important;
-    background: #2196F3 !important;
-    color: white !important;
-    border: none !important;
-    border-radius: 4px !important;
-    cursor: pointer !important;
-    font-size: 13px !important;
-    font-weight: 500 !important;
-    transition: all 0.2s !important;
-}
+        @keyframes slideIn {
+            from { transform: translateX(400px); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
 
-#stats-tracker-panel button {
-    background: #4CAF50 !important;
-}
-
-#capture-panel button:hover,
-#stats-tracker-panel button:hover {
-    transform: translateY(-1px) !important;
-}
-
-#capture-panel button:hover {
-    background: #1976D2 !important;
-}
-
-#stats-tracker-panel button:hover {
-    background: #45a049 !important;
-}
-
-#stop-capture-btn,
-#clear-data-btn {
-    background: #f44336 !important;
-}
-
-#stop-capture-btn:hover,
-#clear-data-btn:hover {
-    background: #da190b !important;
-}
-
-/* Smaller status elements */
-#capture-status,
-#tracker-status {
-    padding: 6px !important;
-    margin: 6px 0 !important;
-    background: rgba(255, 255, 255, 0.1) !important;
-    border: 1px solid rgba(255, 255, 255, 0.2) !important;
-    border-radius: 4px !important;
-    text-align: center !important;
-    font-size: 12px !important;
-    font-weight: 500 !important;
-}
-
-#capture-info,
-#current-game-info,
-#stats-summary {
-    font-size: 11px !important;
-    margin: 8px 0 !important;
-    padding: 6px !important;
-    background: rgba(255, 255, 255, 0.05) !important;
-    border-radius: 4px !important;
-    line-height: 1.4 !important;
-}
-
-/* Responsive adjustments */
-@media (max-width: 768px) {
-    #geoguessr-toolbar {
-        top: 70px !important;
-        right: 10px !important;
-        gap: 6px !important;
-        padding: 8px 6px !important;
-    }
-
-    .geoguessr-toolbar-btn {
-        width: 35px !important;
-        height: 35px !important;
-        font-size: 16px !important;
-    }
-
-    #capture-panel,
-    #stats-tracker-panel {
-        top: 120px !important;
-        right: 10px !important;
-        min-width: 200px !important;
-        padding: 10px !important;
-    }
-}
-
-@media (max-width: 480px) {
-    #geoguessr-toolbar {
-        top: 60px !important;
-        flex-direction: row !important; /* Horizontal on very small screens */
-        gap: 8px !important;
-        padding: 8px 10px !important;
-        border-radius: 15px !important;
-    }
-
-    #capture-panel,
-    #stats-tracker-panel {
-        top: 110px !important;
-        right: 10px !important;
-        min-width: 180px !important;
-    }
-}
+        @keyframes slideOut {
+            from { transform: translateX(0); opacity: 1; }
+            to { transform: translateX(400px); opacity: 0; }
+        }
     `);
 
     // ==================== INITIALIZATION ====================
-    function init() {
-        console.log('🚀 Initializing Stats Tracker...');
+    async function init() {
+        await CountryGeocoder.init();
         createUI();
         startUrlMonitoring();
         updateStatus('Ready to track');
+        updateGameInfo(); // Initialize game info display
 
-        // Expose current game token for screen capture script
         window.geoguessrCurrentGame = () => currentGameToken;
     }
 
-    // Start the script
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
     } else {
